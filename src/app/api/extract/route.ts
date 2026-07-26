@@ -12,7 +12,6 @@ const execFileAsync = promisify(execFile);
 
 // Explicitly construct the path to the binary because Next.js webpack mangles __dirname
 const isWin = os.platform() === 'win32';
-const isProduction = process.env.NODE_ENV === 'production';
 
 const localYtDlp = path.join(
   process.cwd(),
@@ -21,15 +20,13 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-
-// On production Linux (Render), ALWAYS use system 'yt-dlp' from Nixpkgs.
-// The npm-bundled binary in node_modules is old and breaks with modern YouTube.
-// On Windows dev, use the local binary if it exists.
-const ytDlpPath = (!isWin && isProduction)
-  ? 'yt-dlp'
-  : (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp');
-
+// Use local binary if it exists (on Render, nixpacks build downloads the latest
+// yt-dlp here), otherwise fall back to system PATH.
+const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 const youtubedl = create(ytDlpPath);
+
+// isProduction used to pick the right player client per environment
+const isProduction = process.env.NODE_ENV === 'production';
 
 export async function POST(req: Request) {
   const cookiesPath = getCookiesPath();

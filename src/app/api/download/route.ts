@@ -17,11 +17,9 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// On production Linux (Render), ALWAYS use system 'yt-dlp' from Nixpkgs.
-// The npm-bundled binary in node_modules is outdated and breaks with modern YouTube.
-const ytDlpPath = (!isWin && isProduction)
-  ? 'yt-dlp'
-  : (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp');
+// Use local binary if it exists (nixpacks build downloads the latest yt-dlp
+// binary here during Render deployment), otherwise fall back to system PATH.
+const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 
 const localFfmpeg = path.join(
   process.cwd(),
