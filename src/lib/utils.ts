@@ -79,6 +79,15 @@ export function getCookiesPath(): string | null {
     console.warn('[cookies] WARNING: SID and __Secure-3PSID cookies are missing! Full logged-in session cookies (SID, HSID, SSID, __Secure-3PSID, LOGIN_INFO) are required for YouTube authentication.');
   }
 
+  // Normalize line endings to LF (\n) for Unix/Linux/Render compatibility (yt-dlp FAQ spec)
+  trimmed = trimmed.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // Ensure mandatory Netscape header is at the very top of the cookie file
+  if (!trimmed.startsWith('# HTTP Cookie File') && !trimmed.startsWith('# Netscape HTTP Cookie File')) {
+    console.log('[cookies] Adding missing # Netscape HTTP Cookie File header...');
+    trimmed = `# Netscape HTTP Cookie File\n# Generated/Normalized for yt-dlp\n\n${trimmed}`;
+  }
+
   try {
     const tempCookiesPath = path.join(os.tmpdir(), `yt_cookies_${Date.now()}.txt`);
     fs.writeFileSync(tempCookiesPath, trimmed, 'utf-8');
