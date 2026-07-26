@@ -48,8 +48,11 @@ export async function POST(req: Request) {
       const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
       const playerClient = 'youtube:player_client=android_vr,tv_embedded,ios,mweb';
 
+      const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
+
       const cliArgs = [
         '--dump-single-json',
+        '--format', 'best',
         '--no-check-formats',
         '--no-playlist',
         '--quiet',
@@ -58,6 +61,9 @@ export async function POST(req: Request) {
         '--user-agent', desktopUserAgent,
         '--referer', 'https://www.youtube.com/',
       ];
+      if (proxy) {
+        cliArgs.push('--proxy', proxy);
+      }
       if (cookiesPath) {
         cliArgs.push('--cookies', cookiesPath);
       }

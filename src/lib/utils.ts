@@ -57,25 +57,27 @@ export function getCookiesPath(): string | null {
     }
   }
 
-  // Print first 3 lines safely (masking values) to check Netscape compatibility
   const lines = trimmed.split('\n');
   console.log('[cookies] Total cookie lines:', lines.length);
-  lines.slice(0, 5).forEach((line, index) => {
-    if (line.trim().startsWith('#') || line.trim() === '') {
-      console.log(`[cookies] Line ${index + 1}: ${line}`);
-    } else {
+
+  // Check for essential YouTube session cookie keys
+  const essentialKeys = ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID', 'LOGIN_INFO'];
+  const presentKeys: string[] = [];
+  lines.forEach(line => {
+    if (!line.trim().startsWith('#') && line.trim() !== '') {
       const parts = line.split('\t');
       if (parts.length >= 6) {
-        const domain = parts[0];
-        const name = parts[parts.length - 2];
-        const valLen = parts[parts.length - 1].length;
-        console.log(`[cookies] Line ${index + 1}: ${domain} (Tab-separated) | Name: ${name} | Value: [${valLen} chars masked]`);
-      } else {
-        // Not tab separated or malformed
-        console.log(`[cookies] Line ${index + 1} (MALFORMED/No Tabs): ${line.substring(0, 50)}...`);
+        const cookieName = parts[parts.length - 2]?.trim();
+        if (cookieName && essentialKeys.includes(cookieName) && !presentKeys.includes(cookieName)) {
+          presentKeys.push(cookieName);
+        }
       }
     }
   });
+  console.log('[cookies] Detected YouTube Session Keys:', presentKeys.join(', ') || 'None');
+  if (!presentKeys.includes('SID') && !presentKeys.includes('__Secure-3PSID')) {
+    console.warn('[cookies] WARNING: SID and __Secure-3PSID cookies are missing! Full logged-in session cookies (SID, HSID, SSID, __Secure-3PSID, LOGIN_INFO) are required for YouTube authentication.');
+  }
 
   try {
     const tempCookiesPath = path.join(os.tmpdir(), `yt_cookies_${Date.now()}.txt`);
