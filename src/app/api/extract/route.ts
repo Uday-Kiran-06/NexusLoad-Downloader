@@ -43,10 +43,9 @@ export async function POST(req: Request) {
 
 
     if (isProduction) {
-      // On production (Render datacenter IP), use execFile directly to pass raw CLI flags.
-      // On production (Render datacenter IP), use android_vr and tv_embedded as primary clients
-      // which bypass datacenter IP blocks. Avoid web client as first choice on datacenter IPs.
-      const playerClient = 'youtube:player_client=android_vr,tv_embedded,ios,mweb';
+      // On production (Render datacenter IP), use default and exclude android_sdkless
+      // to bypass recent YouTube format blocking / 403 errors.
+      const playerClient = 'youtube:player_client=default,-android_sdkless';
 
       const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
 
@@ -55,6 +54,7 @@ export async function POST(req: Request) {
         '--no-playlist',
         '--quiet',
         '--no-warnings',
+        '--ignore-no-formats-error', // Prevent crash if no formats found (allows metadata extraction)
         '--extractor-args', playerClient,
       ];
       if (proxy) {

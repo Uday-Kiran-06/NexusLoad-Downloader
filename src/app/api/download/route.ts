@@ -69,12 +69,12 @@ export async function GET(req: Request) {
     // Select player client based on environment:
 
     // - 'all' works on localhost (residential IP)
-    // - 'tv_embedded,ios,mweb' bypasses datacenter IP blocks on Render/cloud
+    // - 'default,-android_sdkless' bypasses datacenter IP blocks on Render/cloud
     const isProduction = process.env.NODE_ENV === 'production';
     const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
     const extractorArgs = isProduction
-      ? 'youtube:player_client=android_vr,tv_embedded,ios,mweb'
+      ? 'youtube:player_client=default,-android_sdkless'
       : 'youtube:player_client=all';
 
     const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
