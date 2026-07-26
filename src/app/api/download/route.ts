@@ -82,8 +82,6 @@ export async function GET(req: Request) {
     const commonArgs: any = {
       noWarnings: true,
       extractorArgs,
-      userAgent: desktopUserAgent,
-      referer: 'https://www.youtube.com/',
       concurrentFragments: 8,
       bufferSize: '16K',
     };
