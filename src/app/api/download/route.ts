@@ -8,6 +8,7 @@ import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
 
 // Construct all binary paths dynamically depending on target OS, with fallback to global installations
 const isWin = os.platform() === 'win32';
+const isProduction = process.env.NODE_ENV === 'production';
 
 const localYtDlp = path.join(
   process.cwd(),
@@ -16,8 +17,11 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// Use local binary if it exists, otherwise fall back to system 'yt-dlp'
-const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
+// On production Linux (Render), ALWAYS use system 'yt-dlp' from Nixpkgs.
+// The npm-bundled binary in node_modules is outdated and breaks with modern YouTube.
+const ytDlpPath = (!isWin && isProduction)
+  ? 'yt-dlp'
+  : (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp');
 
 const localFfmpeg = path.join(
   process.cwd(),

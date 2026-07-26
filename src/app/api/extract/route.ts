@@ -12,6 +12,8 @@ const execFileAsync = promisify(execFile);
 
 // Explicitly construct the path to the binary because Next.js webpack mangles __dirname
 const isWin = os.platform() === 'win32';
+const isProduction = process.env.NODE_ENV === 'production';
+
 const localYtDlp = path.join(
   process.cwd(),
   'node_modules',
@@ -19,8 +21,14 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// Use local binary if it exists, otherwise fall back to system 'yt-dlp'
-const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
+
+// On production Linux (Render), ALWAYS use system 'yt-dlp' from Nixpkgs.
+// The npm-bundled binary in node_modules is old and breaks with modern YouTube.
+// On Windows dev, use the local binary if it exists.
+const ytDlpPath = (!isWin && isProduction)
+  ? 'yt-dlp'
+  : (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp');
+
 const youtubedl = create(ytDlpPath);
 
 export async function POST(req: Request) {
@@ -32,9 +40,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'URL provided is empty.' }, { status: 400 });
     }
 
-    const isProduction = process.env.NODE_ENV === 'production';
 
     let info: any;
+
 
     if (isProduction) {
       // On production (Render datacenter IP), use execFile directly so we can
