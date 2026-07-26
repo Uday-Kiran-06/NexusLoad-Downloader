@@ -29,10 +29,17 @@ export async function POST(req: Request) {
     }
 
     // Fetch video info using yt-dlp — returns full format list
+    // IMPORTANT: 'all' or 'web' clients are blocked on datacenter IPs.
+    // 'tv_embedded' and 'ios' bypass YouTube's datacenter restrictions.
     const args: any = {
       dumpSingleJson: true,
       noWarnings: true,
-      extractorArgs: 'youtube:player_client=all',
+      // Try tv_embedded first (no sig required), then ios, then mweb as fallback
+      extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
+      addHeader: [
+        'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+        'Referer:https://www.youtube.com/',
+      ],
     };
     if (cookiesPath) {
       args.cookies = cookiesPath;
