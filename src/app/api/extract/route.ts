@@ -1,10 +1,14 @@
 import { NextResponse } from 'next/server';
 import { create } from 'youtube-dl-exec';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
 
 import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
+
+const execFileAsync = promisify(execFile);
 
 // Explicitly construct the path to the binary because Next.js webpack mangles __dirname
 const isWin = os.platform() === 'win32';
@@ -28,33 +32,50 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'URL provided is empty.' }, { status: 400 });
     }
 
-    // Select player client based on environment:
-    // - 'all' works on localhost (residential IP, standard web client works)
-    // - 'tv_embedded,ios,mweb' bypasses datacenter IP blocks on Render/cloud
     const isProduction = process.env.NODE_ENV === 'production';
-    const extractorArgs = isProduction
-      ? 'youtube:player_client=tv_embedded,ios,mweb'
-      : 'youtube:player_client=all';
 
-    const args: any = {
-      dumpSingleJson: true,
-      noWarnings: true,
-      extractorArgs,
-      // In production, tv_embedded/ios clients only expose combined progressive
-      // streams (no separate DASH video+audio). yt-dlp's default format selector
-      // 'bestvideo+bestaudio' fails when DASH isn't available, so we explicitly
-      // set 'best' which always succeeds. dumpSingleJson still returns ALL formats
-      // in info.formats so the resolution picker in the UI works as normal.
-      ...(isProduction && { format: 'best' }),
-      addHeader: [
-        'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
-        'Referer:https://www.youtube.com/',
-      ],
-    };
-    if (cookiesPath) {
-      args.cookies = cookiesPath;
+    let info: any;
+
+    if (isProduction) {
+      // On production (Render datacenter IP), use execFile directly so we can
+      // pass --no-check-formats as a raw CLI flag — youtube-dl-exec's option
+      // conversion is unreliable across yt-dlp versions on Linux.
+      const cliArgs = [
+        '--dump-single-json',
+        '--no-check-formats',
+        '--no-playlist',
+        '--quiet',
+        '--no-warnings',
+        '--extractor-args', 'youtube:player_client=tv_embedded,ios,mweb',
+        '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+        '--add-header', 'Referer:https://www.youtube.com/',
+      ];
+      if (cookiesPath) {
+        cliArgs.push('--cookies', cookiesPath);
+      }
+      cliArgs.push(url);
+
+      console.log(`[extract] Running: ${ytDlpPath} ${cliArgs.slice(0, -1).join(' ')} <url>`);
+      const { stdout, stderr } = await execFileAsync(ytDlpPath, cliArgs, {
+        maxBuffer: 50 * 1024 * 1024, // 50MB
+      });
+      if (stderr) console.warn('[extract] yt-dlp stderr:', stderr);
+      info = JSON.parse(stdout);
+    } else {
+      // On localhost, use youtube-dl-exec wrapper — player_client=all works fine
+      // on residential IPs without needing --no-check-formats.
+      const args: any = {
+        dumpSingleJson: true,
+        noWarnings: true,
+        extractorArgs: 'youtube:player_client=all',
+        addHeader: [
+          'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+          'Referer:https://www.youtube.com/',
+        ],
+      };
+      if (cookiesPath) args.cookies = cookiesPath;
+      info = await youtubedl(url, args) as any;
     }
-    const info = await youtubedl(url, args) as any;
 
     const encodedUrl = encodeURIComponent(url);
     const encodedTitle = encodeURIComponent(info.title || 'video');
