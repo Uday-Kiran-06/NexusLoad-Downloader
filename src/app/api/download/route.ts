@@ -77,6 +77,8 @@ export async function GET(req: Request) {
       ? 'youtube:player_client=android_vr,tv_embedded,ios,mweb'
       : 'youtube:player_client=all';
 
+    const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
+
     const commonArgs: any = {
       noWarnings: true,
       extractorArgs,
@@ -85,6 +87,9 @@ export async function GET(req: Request) {
       concurrentFragments: 8,
       bufferSize: '16K',
     };
+    if (proxy) {
+      commonArgs.proxy = proxy;
+    }
     if (cookiesPath) {
       commonArgs.cookies = cookiesPath;
     }
