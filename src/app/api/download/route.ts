@@ -4,6 +4,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
 
 // Construct all binary paths dynamically depending on target OS, with fallback to global installations
 const isWin = os.platform() === 'win32';
@@ -48,6 +49,7 @@ function safeCleanup(dir: string) {
 }
 
 export async function GET(req: Request) {
+  const cookiesPath = getCookiesPath();
   const { searchParams } = new URL(req.url);
   const url = searchParams.get('url');
   const format = searchParams.get('format') || 'best';
@@ -67,6 +69,9 @@ export async function GET(req: Request) {
       concurrentFragments: 8,   // download 8 DASH fragments in parallel
       bufferSize: '16K',        // larger read buffer for faster streaming
     };
+    if (cookiesPath) {
+      commonArgs.cookies = cookiesPath;
+    }
 
     if (isAudioOnly) {
       // ── Audio only: single download, no merge needed ──────────────────────
@@ -149,6 +154,8 @@ export async function GET(req: Request) {
     const msg = error?.stderr || error?.message || String(error);
     console.error('Download route error:', msg);
     return new NextResponse('Failed: ' + msg, { status: 500 });
+  } finally {
+    cleanupCookiesFile(cookiesPath);
   }
 }
 

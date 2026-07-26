@@ -4,6 +4,8 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 
+import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
+
 // Explicitly construct the path to the binary because Next.js webpack mangles __dirname
 const isWin = os.platform() === 'win32';
 const localYtDlp = path.join(
@@ -17,6 +19,7 @@ const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 const youtubedl = create(ytDlpPath);
 
 export async function POST(req: Request) {
+  const cookiesPath = getCookiesPath();
   try {
     const { url } = await req.json();
 
@@ -25,11 +28,15 @@ export async function POST(req: Request) {
     }
 
     // Fetch video info using yt-dlp — returns full format list
-    const info = await youtubedl(url, {
+    const args: any = {
       dumpSingleJson: true,
       noWarnings: true,
       extractorArgs: 'youtube:player_client=all',
-    } as any) as any;
+    };
+    if (cookiesPath) {
+      args.cookies = cookiesPath;
+    }
+    const info = await youtubedl(url, args) as any;
 
     const encodedUrl = encodeURIComponent(url);
     const encodedTitle = encodeURIComponent(info.title || 'video');
@@ -113,5 +120,7 @@ export async function POST(req: Request) {
   } catch (error: any) {
     console.error('Extraction error (yt-dlp):', error);
     return NextResponse.json({ error: 'Failed to extract media. The video might be private or geo-restricted.' }, { status: 500 });
+  } finally {
+    cleanupCookiesFile(cookiesPath);
   }
 }
