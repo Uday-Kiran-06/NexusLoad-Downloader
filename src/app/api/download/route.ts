@@ -16,10 +16,8 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// On Linux/Render, prioritize the global Nix-installed 'yt-dlp' package which is kept up-to-date
-const ytDlpPath = isWin
-  ? (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp')
-  : 'yt-dlp';
+// Use local binary if it exists, otherwise fall back to system 'yt-dlp'
+const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 
 const localFfmpeg = path.join(
   process.cwd(),
@@ -154,8 +152,13 @@ export async function GET(req: Request) {
 
   } catch (error: any) {
     safeCleanup(tmpDir);
+    console.error('Download route error details:', {
+      message: error?.message,
+      stderr: error?.stderr,
+      stdout: error?.stdout,
+      code: error?.code,
+    });
     const msg = error?.stderr || error?.message || String(error);
-    console.error('Download route error:', msg);
     return new NextResponse('Failed: ' + msg, { status: 500 });
   } finally {
     cleanupCookiesFile(cookiesPath);

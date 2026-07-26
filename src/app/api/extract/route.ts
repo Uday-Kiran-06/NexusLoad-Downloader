@@ -15,10 +15,8 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// On Linux/Render, prioritize the global Nix-installed 'yt-dlp' package which is kept up-to-date
-const ytDlpPath = isWin
-  ? (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp')
-  : 'yt-dlp';
+// Use local binary if it exists, otherwise fall back to system 'yt-dlp'
+const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 const youtubedl = create(ytDlpPath);
 
 export async function POST(req: Request) {
@@ -121,8 +119,13 @@ export async function POST(req: Request) {
     });
 
   } catch (error: any) {
-    console.error('Extraction error (yt-dlp):', error);
-    return NextResponse.json({ error: 'Failed to extract media. The video might be private or geo-restricted.' }, { status: 500 });
+    console.error('Extraction error (yt-dlp) details:', {
+      message: error?.message,
+      stderr: error?.stderr,
+      stdout: error?.stdout,
+      code: error?.code,
+    });
+    return NextResponse.json({ error: `Failed to extract media: ${error?.message || error?.stderr || 'Unknown error'}` }, { status: 500 });
   } finally {
     cleanupCookiesFile(cookiesPath);
   }
