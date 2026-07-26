@@ -5,9 +5,26 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
-// Construct all binary paths manually — Next.js webpack mangles module-resolved paths to \ROOT\
-const ytDlpPath = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
-const ffmpegPath = path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe');
+// Construct all binary paths dynamically depending on target OS, with fallback to global installations
+const isWin = os.platform() === 'win32';
+
+const localYtDlp = path.join(
+  process.cwd(),
+  'node_modules',
+  'youtube-dl-exec',
+  'bin',
+  isWin ? 'yt-dlp.exe' : 'yt-dlp'
+);
+const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
+
+const localFfmpeg = path.join(
+  process.cwd(),
+  'node_modules',
+  'ffmpeg-static',
+  isWin ? 'ffmpeg.exe' : 'ffmpeg'
+);
+const ffmpegPath = fs.existsSync(localFfmpeg) ? localFfmpeg : 'ffmpeg';
+
 const youtubedl = create(ytDlpPath);
 ffmpeg.setFfmpegPath(ffmpegPath);
 

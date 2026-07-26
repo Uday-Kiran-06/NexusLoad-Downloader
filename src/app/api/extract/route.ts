@@ -1,9 +1,19 @@
 import { NextResponse } from 'next/server';
 import { create } from 'youtube-dl-exec';
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
 
 // Explicitly construct the path to the binary because Next.js webpack mangles __dirname
-const ytDlpPath = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
+const isWin = os.platform() === 'win32';
+const localYtDlp = path.join(
+  process.cwd(),
+  'node_modules',
+  'youtube-dl-exec',
+  'bin',
+  isWin ? 'yt-dlp.exe' : 'yt-dlp'
+);
+const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 const youtubedl = create(ytDlpPath);
 
 export async function POST(req: Request) {
