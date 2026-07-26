@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { create } from 'youtube-dl-exec';
+import ytdl from '@distube/ytdl-core';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -166,13 +167,79 @@ export async function POST(req: Request) {
     });
 
   } catch (error: any) {
-    console.error('Extraction error (yt-dlp) details:', {
+    console.error('[extract] Primary extraction (yt-dlp) failed:', {
       message: error?.message,
       stderr: error?.stderr,
-      stdout: error?.stdout,
       code: error?.code,
     });
-    return NextResponse.json({ error: `Failed to extract media: ${error?.message || error?.stderr || 'Unknown error'}` }, { status: 500 });
+
+    console.log('[extract] Attempting fallback extraction via @distube/ytdl-core...');
+    try {
+      const { url } = await req.clone().json();
+      const ytdlInfo = await ytdl.getInfo(url);
+
+      const title = ytdlInfo.videoDetails.title || 'Video';
+      const thumbnail = ytdlInfo.videoDetails.thumbnails?.[ytdlInfo.videoDetails.thumbnails.length - 1]?.url || null;
+
+      const encodedUrl = encodeURIComponent(url);
+      const encodedTitle = encodeURIComponent(title);
+      const options = [];
+      let idCounter = 1;
+
+      const videoHeights = new Set<number>();
+      (ytdlInfo.formats || []).forEach((f: any) => {
+        if (f.hasVideo && f.height) {
+          videoHeights.add(f.height);
+        }
+      });
+
+      const sortedHeights = Array.from(videoHeights).sort((a, b) => b - a);
+
+      for (const height of sortedHeights) {
+        const formatStr = encodeURIComponent(`bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`);
+        options.push({
+          id: idCounter++,
+          quality: `${height}p`,
+          format: 'MP4',
+          size: '—',
+          type: 'video',
+          url: `/api/download?url=${encodedUrl}&format=${formatStr}&title=${encodedTitle}`,
+        });
+      }
+
+      if (options.length === 0) {
+        const formatStr = encodeURIComponent('bestvideo+bestaudio/best');
+        options.push({
+          id: idCounter++,
+          quality: 'Best Available',
+          format: 'MP4',
+          size: '—',
+          type: 'video',
+          url: `/api/download?url=${encodedUrl}&format=${formatStr}&title=${encodedTitle}`,
+        });
+      }
+
+      const audioFormatStr = encodeURIComponent('bestaudio[ext=m4a]/bestaudio');
+      options.push({
+        id: idCounter++,
+        quality: 'Audio Only',
+        format: 'MP3',
+        size: '—',
+        type: 'audio',
+        url: `/api/download?url=${encodedUrl}&format=${audioFormatStr}&title=${encodedTitle}`,
+      });
+
+      console.log('[extract] Fallback extraction (@distube/ytdl-core) succeeded!');
+      return NextResponse.json({
+        title,
+        thumbnail,
+        options,
+      });
+
+    } catch (fallbackError: any) {
+      console.error('[extract] Fallback extraction (@distube/ytdl-core) also failed:', fallbackError?.message);
+      return NextResponse.json({ error: `Failed to extract media: ${error?.message || error?.stderr || fallbackError?.message || 'Unknown error'}` }, { status: 500 });
+    }
   } finally {
     cleanupCookiesFile(cookiesPath);
   }
