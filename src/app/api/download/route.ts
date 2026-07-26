@@ -16,7 +16,10 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
+// On Linux/Render, prioritize the global Nix-installed 'yt-dlp' package which is kept up-to-date
+const ytDlpPath = isWin
+  ? (fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp')
+  : 'yt-dlp';
 
 const localFfmpeg = path.join(
   process.cwd(),
