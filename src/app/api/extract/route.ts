@@ -42,18 +42,21 @@ export async function POST(req: Request) {
 
 
     if (isProduction) {
-      // On production (Render datacenter IP), use execFile directly so we can
-      // pass --no-check-formats as a raw CLI flag — youtube-dl-exec's option
-      // conversion is unreliable across yt-dlp versions on Linux.
+      // On production (Render datacenter IP), use execFile directly to pass raw CLI flags.
+      // Adjust player_client and User-Agent dynamically based on whether cookies are provided:
+      // Desktop cookies + Android UA = YouTube security flag ("Sign in to confirm you're not a bot").
+      const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      const playerClient = cookiesPath ? 'youtube:player_client=web,mweb,ios,tv_embedded' : 'youtube:player_client=tv_embedded,ios,mweb';
+
       const cliArgs = [
         '--dump-single-json',
         '--no-check-formats',
         '--no-playlist',
         '--quiet',
         '--no-warnings',
-        '--extractor-args', 'youtube:player_client=tv_embedded,ios,mweb',
-        '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
-        '--add-header', 'Referer:https://www.youtube.com/',
+        '--extractor-args', playerClient,
+        '--user-agent', desktopUserAgent,
+        '--referer', 'https://www.youtube.com/',
       ];
       if (cookiesPath) {
         cliArgs.push('--cookies', cookiesPath);

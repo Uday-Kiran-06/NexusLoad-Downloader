@@ -71,17 +71,17 @@ export async function GET(req: Request) {
     // - 'all' works on localhost (residential IP)
     // - 'tv_embedded,ios,mweb' bypasses datacenter IP blocks on Render/cloud
     const isProduction = process.env.NODE_ENV === 'production';
+    const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
     const extractorArgs = isProduction
-      ? 'youtube:player_client=tv_embedded,ios,mweb'
+      ? (cookiesPath ? 'youtube:player_client=web,mweb,ios,tv_embedded' : 'youtube:player_client=tv_embedded,ios,mweb')
       : 'youtube:player_client=all';
 
     const commonArgs: any = {
       noWarnings: true,
       extractorArgs,
-      addHeader: [
-        'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
-        'Referer:https://www.youtube.com/',
-      ],
+      userAgent: desktopUserAgent,
+      referer: 'https://www.youtube.com/',
       concurrentFragments: 8,
       bufferSize: '16K',
     };
