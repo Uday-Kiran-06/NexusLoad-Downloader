@@ -43,10 +43,10 @@ export async function POST(req: Request) {
 
     if (isProduction) {
       // On production (Render datacenter IP), use execFile directly to pass raw CLI flags.
-      // Adjust player_client and User-Agent dynamically based on whether cookies are provided:
-      // Desktop cookies + Android UA = YouTube security flag ("Sign in to confirm you're not a bot").
+      // android_vr (YouTube VR) and tv_embedded clients bypass datacenter IP blocks
+      // and do not require PO tokens or bot sign-in verification.
       const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-      const playerClient = cookiesPath ? 'youtube:player_client=web,mweb,ios,tv_embedded' : 'youtube:player_client=tv_embedded,ios,mweb';
+      const playerClient = 'youtube:player_client=android_vr,tv_embedded,ios,mweb';
 
       const cliArgs = [
         '--dump-single-json',

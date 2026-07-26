@@ -74,7 +74,7 @@ export async function GET(req: Request) {
     const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
     const extractorArgs = isProduction
-      ? (cookiesPath ? 'youtube:player_client=web,mweb,ios,tv_embedded' : 'youtube:player_client=tv_embedded,ios,mweb')
+      ? 'youtube:player_client=android_vr,tv_embedded,ios,mweb'
       : 'youtube:player_client=all';
 
     const commonArgs: any = {
