@@ -40,6 +40,12 @@ export async function POST(req: Request) {
       dumpSingleJson: true,
       noWarnings: true,
       extractorArgs,
+      // In production, tv_embedded/ios clients only expose combined progressive
+      // streams (no separate DASH video+audio). yt-dlp's default format selector
+      // 'bestvideo+bestaudio' fails when DASH isn't available, so we explicitly
+      // set 'best' which always succeeds. dumpSingleJson still returns ALL formats
+      // in info.formats so the resolution picker in the UI works as normal.
+      ...(isProduction && { format: 'best' }),
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',
