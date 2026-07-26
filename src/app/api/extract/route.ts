@@ -43,19 +43,16 @@ export async function POST(req: Request) {
 
     if (isProduction) {
       // On production (Render datacenter IP), use execFile directly to pass raw CLI flags.
-      // Adjust player_client based on cookies:
-      // When cookies are present, try web first (authenticated session), then mweb, ios, tv_embedded.
-      // When cookies are missing, try android_vr, tv_embedded, ios, mweb to bypass bot check.
-      const playerClient = cookiesPath
-        ? 'youtube:player_client=web,mweb,ios,tv_embedded'
-        : 'youtube:player_client=android_vr,tv_embedded,ios,mweb';
+      // On production (Render datacenter IP), use android_vr and tv_embedded as primary clients
+      // which bypass datacenter IP blocks. Avoid web client as first choice on datacenter IPs.
+      const playerClient = 'youtube:player_client=android_vr,tv_embedded,ios,mweb';
 
       const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
       const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
 
       const cliArgs = [
         '--dump-single-json',
-        '--format', 'bv*+ba*/b*',
+        '--format', 'all',
         '--no-check-formats',
         '--no-playlist',
         '--quiet',
