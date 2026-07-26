@@ -36,6 +36,9 @@ export async function POST(req: Request) {
       noWarnings: true,
       // Try tv_embedded first (no sig required), then ios, then mweb as fallback
       extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
+      // Skip format availability check — tv_embedded/ios return different format IDs
+      // and the check itself can fail even when formats are available
+      noCheckFormats: true,
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',

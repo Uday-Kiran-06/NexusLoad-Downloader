@@ -69,12 +69,14 @@ export async function GET(req: Request) {
       // IMPORTANT: 'all' or 'web' clients are blocked on datacenter IPs.
       // 'tv_embedded' and 'ios' bypass YouTube's datacenter restrictions.
       extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
+      // Skip format check — tv_embedded/ios return different format IDs
+      noCheckFormats: true,
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',
       ],
-      concurrentFragments: 8,   // download 8 DASH fragments in parallel
-      bufferSize: '16K',        // larger read buffer for faster streaming
+      concurrentFragments: 8,
+      bufferSize: '16K',
     };
     if (cookiesPath) {
       commonArgs.cookies = cookiesPath;
@@ -114,10 +116,12 @@ export async function GET(req: Request) {
 
       console.log(`[download] Downloading video (${height}p) and audio separately...`);
 
-      // Download video-only and audio-only streams in parallel
+      // Download video-only and audio-only streams in parallel.
+      // Use permissive format strings without [ext=mp4] — tv_embedded/ios may
+      // serve webm/av1/other containers which get muxed into mp4 by ffmpeg.
       await Promise.all([
-        youtubedl(url, { ...commonArgs, output: videoFile, format: `bestvideo[height<=${height}][ext=mp4]/bestvideo[height<=${height}]` }),
-        youtubedl(url, { ...commonArgs, output: audioFile, format: 'bestaudio[ext=m4a]/bestaudio' }),
+        youtubedl(url, { ...commonArgs, output: videoFile, format: `bestvideo[height<=${height}]/bestvideo` }),
+        youtubedl(url, { ...commonArgs, output: audioFile, format: 'bestaudio[ext=m4a]/bestaudio/best' }),
       ]);
 
       // Find the actual downloaded video file (yt-dlp may change the filename)
