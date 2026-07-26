@@ -64,11 +64,18 @@ export async function GET(req: Request) {
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
+    // Select player client based on environment:
+
+    // - 'all' works on localhost (residential IP)
+    // - 'tv_embedded,ios,mweb' bypasses datacenter IP blocks on Render/cloud
+    const isProduction = process.env.NODE_ENV === 'production';
+    const extractorArgs = isProduction
+      ? 'youtube:player_client=tv_embedded,ios,mweb'
+      : 'youtube:player_client=all';
+
     const commonArgs: any = {
       noWarnings: true,
-      // IMPORTANT: 'all' or 'web' clients are blocked on datacenter IPs.
-      // 'tv_embedded' and 'ios' bypass YouTube's datacenter restrictions.
-      extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
+      extractorArgs,
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',

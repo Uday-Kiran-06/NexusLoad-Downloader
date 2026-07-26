@@ -28,19 +28,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'URL provided is empty.' }, { status: 400 });
     }
 
-    // Fetch video info using yt-dlp — returns full format list
-    // IMPORTANT: 'all' or 'web' clients are blocked on datacenter IPs.
-    // 'tv_embedded' and 'ios' bypass YouTube's datacenter restrictions.
+    // Select player client based on environment:
+    // - 'all' works on localhost (residential IP, standard web client works)
+    // - 'tv_embedded,ios,mweb' bypasses datacenter IP blocks on Render/cloud
+    const isProduction = process.env.NODE_ENV === 'production';
+    const extractorArgs = isProduction
+      ? 'youtube:player_client=tv_embedded,ios,mweb'
+      : 'youtube:player_client=all';
+
     const args: any = {
       dumpSingleJson: true,
       noWarnings: true,
-      // Try tv_embedded first (no sig required), then ios, then mweb as fallback
-      extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
-      // Explicitly set a permissive format so yt-dlp doesn't default to
-      // 'bestvideo+bestaudio' which requires DASH streams (not always available
-      // via tv_embedded/ios clients on datacenter IPs).
-      // dumpSingleJson still returns ALL formats in info.formats regardless.
-      format: 'bestvideo*+bestaudio/best',
+      extractorArgs,
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',
