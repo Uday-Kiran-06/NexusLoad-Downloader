@@ -39,14 +39,6 @@ export function getCookiesPath(): string | null {
       for (const c of cookieArray) {
         if (!c.domain || !c.name) continue;
         
-        // Netscape format fields:
-        // 1. domain (e.g. .youtube.com)
-        // 2. subdomains flag (TRUE/FALSE)
-        // 3. path (e.g. /)
-        // 4. secure flag (TRUE/FALSE)
-        // 5. expiration (UNIX timestamp string)
-        // 6. name
-        // 7. value
         const domain = c.domain;
         const subdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
         const path = c.path || '/';
@@ -64,6 +56,26 @@ export function getCookiesPath(): string | null {
       console.error('[cookies] Failed to parse JSON cookies:', err);
     }
   }
+
+  // Print first 3 lines safely (masking values) to check Netscape compatibility
+  const lines = trimmed.split('\n');
+  console.log('[cookies] Total cookie lines:', lines.length);
+  lines.slice(0, 5).forEach((line, index) => {
+    if (line.trim().startsWith('#') || line.trim() === '') {
+      console.log(`[cookies] Line ${index + 1}: ${line}`);
+    } else {
+      const parts = line.split('\t');
+      if (parts.length >= 6) {
+        const domain = parts[0];
+        const name = parts[parts.length - 2];
+        const valLen = parts[parts.length - 1].length;
+        console.log(`[cookies] Line ${index + 1}: ${domain} (Tab-separated) | Name: ${name} | Value: [${valLen} chars masked]`);
+      } else {
+        // Not tab separated or malformed
+        console.log(`[cookies] Line ${index + 1} (MALFORMED/No Tabs): ${line.substring(0, 50)}...`);
+      }
+    }
+  });
 
   try {
     const tempCookiesPath = path.join(os.tmpdir(), `yt_cookies_${Date.now()}.txt`);
