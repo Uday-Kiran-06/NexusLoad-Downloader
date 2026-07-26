@@ -36,9 +36,11 @@ export async function POST(req: Request) {
       noWarnings: true,
       // Try tv_embedded first (no sig required), then ios, then mweb as fallback
       extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
-      // Skip format availability check — tv_embedded/ios return different format IDs
-      // and the check itself can fail even when formats are available
-      noCheckFormats: true,
+      // Explicitly set a permissive format so yt-dlp doesn't default to
+      // 'bestvideo+bestaudio' which requires DASH streams (not always available
+      // via tv_embedded/ios clients on datacenter IPs).
+      // dumpSingleJson still returns ALL formats in info.formats regardless.
+      format: 'bestvideo*+bestaudio/best',
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',

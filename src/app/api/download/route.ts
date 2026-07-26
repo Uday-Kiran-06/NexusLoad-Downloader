@@ -69,8 +69,6 @@ export async function GET(req: Request) {
       // IMPORTANT: 'all' or 'web' clients are blocked on datacenter IPs.
       // 'tv_embedded' and 'ios' bypass YouTube's datacenter restrictions.
       extractorArgs: 'youtube:player_client=tv_embedded,ios,mweb',
-      // Skip format check — tv_embedded/ios return different format IDs
-      noCheckFormats: true,
       addHeader: [
         'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
         'Referer:https://www.youtube.com/',
