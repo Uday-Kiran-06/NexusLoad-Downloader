@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 
 type MediaOption = { id: number; quality: string; format: string; size: string; type: string; url: string };
 
@@ -216,7 +217,12 @@ export default function Home() {
       )}
 
       {/* Header */}
-      <header className="w-full p-6 flex items-center justify-between z-10">
+      <motion.header 
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+        className="w-full p-6 flex items-center justify-between z-50 relative"
+      >
         <div className="flex items-center gap-2">
           <img src="/logo.png" alt="NexusLoad Logo" className="w-8 h-8 rounded-lg object-cover shadow-[0_0_15px_rgba(168,85,247,0.4)]" />
           <span className="text-xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-blue-400">
@@ -224,22 +230,32 @@ export default function Home() {
           </span>
         </div>
         <nav className="hidden sm:flex gap-6 text-sm font-medium text-slate-400 relative">
-          <button onClick={() => setShowSites(v => !v)} className="hover:text-white transition-colors flex items-center gap-1">
+          <button suppressHydrationWarning onClick={() => setShowSites(v => !v)} className="hover:text-white transition-colors flex items-center gap-1">
             Supported Sites
             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform duration-200 ${showSites ? 'rotate-180' : ''}`}><polyline points="6 9 12 15 18 9" /></svg>
           </button>
           <a href="#" className="hover:text-white transition-colors">FAQ</a>
 
           {/* Supported Sites Dropdown */}
-          {showSites && (
-            <>
-              {/* Backdrop */}
-              <div className="fixed inset-0 z-30" onClick={() => setShowSites(false)} />
-              <div className="absolute right-0 top-8 z-40 w-[480px] glass-panel rounded-2xl p-5 shadow-2xl border border-purple-500/20">
+          <AnimatePresence>
+            {showSites && (
+              <>
+                {/* Backdrop */}
+                <motion.div 
+                  initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                  className="fixed inset-0 z-30" onClick={() => setShowSites(false)} 
+                />
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95, y: -10 }} 
+                  animate={{ opacity: 1, scale: 1, y: 0 }} 
+                  exit={{ opacity: 0, scale: 0.95, y: -10 }}
+                  transition={{ duration: 0.2, ease: "easeOut" }}
+                  className="absolute right-0 top-8 z-40 w-[480px] bg-[#111] rounded-2xl p-5 shadow-2xl border border-purple-500/20"
+                >
                 <p className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-3">Supported Platforms</p>
                 <div className="grid grid-cols-3 gap-2">
                   {SITES.map((s) => (
-                    <div key={s.name} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 transition-colors">
+                    <div key={s.name} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1c1c1c] hover:bg-[#2a2a2a] transition-colors">
                       <span className="text-lg leading-none">{s.icon}</span>
                       <div className="min-w-0">
                         <p className="text-xs font-semibold text-white truncate">{s.name}</p>
@@ -249,29 +265,39 @@ export default function Home() {
                   ))}
                 </div>
                 <p className="text-[10px] text-slate-600 mt-3 text-center">Powered by yt-dlp — supports 1000+ sites</p>
-              </div>
-            </>
-          )}
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
         </nav>
-      </header>
+      </motion.header>
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col items-center justify-center p-6 z-10">
         <div className="max-w-2xl w-full flex flex-col items-center text-center gap-8">
 
-          <h1 className="text-5xl sm:text-6xl font-extrabold tracking-tight leading-tight">
+          <motion.h1 
+            initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }}
+            className="text-5xl sm:text-6xl font-extrabold tracking-tight leading-tight"
+          >
             Download Any Media <br />
             <span className="text-transparent bg-clip-text bg-gradient-to-r from-purple-400 via-pink-400 to-blue-400">
               Without Limits.
             </span>
-          </h1>
+          </motion.h1>
 
-          <p className="text-lg text-slate-400 max-w-lg -mt-4">
+          <motion.p 
+            initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.1 }}
+            className="text-lg text-slate-400 max-w-lg -mt-4"
+          >
             Paste a link from YouTube, Instagram, Twitter, or TikTok and get high-quality videos and audio instantly.
-          </p>
+          </motion.p>
 
           {/* URL Input */}
-          <div className="w-full max-w-xl">
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.2 }}
+            className="w-full max-w-xl"
+          >
             <div
               className={`relative glass-panel rounded-2xl p-2 flex flex-col sm:flex-row gap-2 transition-all duration-300 ${isHovering ? "shadow-[0_0_30px_rgba(168,85,247,0.15)] border-purple-500/30" : ""}`}
               onMouseEnter={() => setIsHovering(true)}
@@ -283,6 +309,7 @@ export default function Home() {
                   <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
                 </svg>
                 <input
+                  suppressHydrationWarning
                   type="url"
                   placeholder="Paste a YouTube, TikTok, or Instagram link..."
                   className="w-full bg-transparent border-none outline-none text-white placeholder:text-slate-500 pl-12 pr-4 py-3"
@@ -292,6 +319,7 @@ export default function Home() {
                 />
               </div>
               <button
+                suppressHydrationWarning
                 onClick={handleExtract}
                 disabled={isLoading}
                 className="glow-effect rounded-xl bg-white text-black font-semibold px-6 py-3 sm:py-0 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed min-w-[140px]"
@@ -314,21 +342,27 @@ export default function Home() {
                 )}
               </button>
             </div>
-          </div>
+            </motion.div>
 
           {/* Error */}
           {error && (
-            <div className="mt-2 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 max-w-xl w-full text-left flex items-center gap-3">
+            <motion.div 
+              initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+              className="mt-2 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 max-w-xl w-full text-left flex items-center gap-3"
+            >
               <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
               </svg>
               <span className="text-sm">{error}</span>
-            </div>
+            </motion.div>
           )}
 
           {/* Format Options */}
           {mediaOptions && mediaInfo && (
-            <div className="w-full max-w-xl flex flex-col gap-5 text-left">
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }}
+              className="w-full max-w-xl flex flex-col gap-5 text-left"
+            >
               <div className="flex gap-4 items-center bg-white/5 p-3 rounded-2xl border border-white/5">
                 {mediaInfo.thumbnail && (
                   <img src={mediaInfo.thumbnail} alt={mediaInfo.title} className="w-20 h-20 object-cover rounded-xl shadow-lg flex-shrink-0" />
@@ -361,18 +395,21 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-            </div>
+            </motion.div>
           )}
 
           {/* Platform badges */}
           {!mediaOptions && (
-            <div className="flex gap-3 mt-2 flex-wrap justify-center">
+            <motion.div 
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.5, delay: 0.4 }}
+              className="flex gap-3 mt-2 flex-wrap justify-center"
+            >
               {["YOUTUBE", "INSTAGRAM", "TIKTOK", "TWITTER"].map((p) => (
                 <span key={p} className="text-xs font-bold tracking-widest text-slate-600 px-3 py-1 rounded-full border border-white/5">
                   {p}
                 </span>
               ))}
-            </div>
+            </motion.div>
           )}
 
         </div>
