@@ -76,7 +76,8 @@ export default function Home() {
       setMediaInfo({ title: data.title, thumbnail: data.thumbnail });
       setMediaOptions(data.options);
     } catch (err: any) {
-      setError(err.message);
+      console.error("Extraction error:", err);
+      setError("Srever is busy");
     } finally {
       setIsLoading(false);
     }
@@ -149,7 +150,8 @@ export default function Home() {
       await new Promise((r) => setTimeout(r, 1200));
     } catch (err: any) {
       clearInterval(fakeTimer);
-      setError(err.message || "Download failed.");
+      console.error("Download error:", err);
+      setError("Srever is busy");
     } finally {
       setIsDownloading(false);
       setProgress(0);
