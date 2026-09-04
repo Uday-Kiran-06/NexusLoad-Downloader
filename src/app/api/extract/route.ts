@@ -1,19 +1,16 @@
 import { NextResponse } from 'next/server';
-import { create } from 'youtube-dl-exec';
 import ytdl from '@distube/ytdl-core';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
 
 import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
+import { validateUrl, sanitizeFilename, parseBoundedJson } from '@/lib/validation';
+import { createApiError } from '@/lib/errors';
+import { runCommandWithLifecycle, TIMEOUT_CONFIG } from '@/lib/process-manager';
 
-const execFileAsync = promisify(execFile);
-
-// Explicitly construct the path to the binary because Next.js webpack mangles __dirname
+// Binary path resolution
 const isWin = os.platform() === 'win32';
-
 const localYtDlp = path.join(
   process.cwd(),
   'node_modules',
@@ -21,109 +18,221 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// Use local binary if it exists (on Render, nixpacks build downloads the latest
-// yt-dlp here), otherwise fall back to system PATH.
 const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
-const youtubedl = create(ytDlpPath);
-
-// isProduction used to pick the right player client per environment
 const isProduction = process.env.NODE_ENV === 'production';
+
+interface YtDlpFormat {
+  vcodec?: string;
+  acodec?: string;
+  height?: number;
+  abr?: number;
+  filesize?: number;
+  filesize_approx?: number;
+}
+
+interface YtDlpInfo {
+  title?: string;
+  thumbnail?: string;
+  formats?: YtDlpFormat[];
+}
 
 export async function POST(req: Request) {
   const cookiesPath = getCookiesPath();
+
   try {
-    const { url } = await req.json();
-
-    if (!url) {
-      return NextResponse.json({ error: 'URL provided is empty.' }, { status: 400 });
+    const parseResult = await parseBoundedJson<Record<string, unknown>>(req);
+    if (parseResult.error) {
+      return createApiError(parseResult.error.code, parseResult.error.message, parseResult.error.status);
     }
 
+    const body = parseResult.data || {};
 
-    let info: any;
-
-
-    if (isProduction) {
-      // On production (Render datacenter IP), use default and exclude android_sdkless
-      // to bypass recent YouTube format blocking / 403 errors.
-      const playerClient = 'youtube:player_client=default,-android_sdkless';
-
-      const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
-
-      const cliArgs = [
-        '--dump-single-json',
-        '--no-playlist',
-        '--quiet',
-        '--no-warnings',
-        '--ignore-no-formats-error', // Prevent crash if no formats found (allows metadata extraction)
-        '--extractor-args', playerClient,
-      ];
-      if (proxy) {
-        cliArgs.push('--proxy', proxy);
+    // Strict allowlist: only 'url' is accepted
+    for (const key of Object.keys(body)) {
+      if (key !== 'url') {
+        return createApiError('INVALID_REQUEST', `Unexpected field '${key}' in request body.`, 400);
       }
-      if (cookiesPath) {
-        cliArgs.push('--cookies', cookiesPath);
-      }
-      cliArgs.push(url);
+    }
 
-      console.log(`[extract] Running: ${ytDlpPath} ${cliArgs.slice(0, -1).join(' ')} <url>`);
-      const { stdout, stderr } = await execFileAsync(ytDlpPath, cliArgs, {
-        maxBuffer: 50 * 1024 * 1024, // 50MB
+    const { url } = body;
+
+    // 1. Server-side URL Validation
+    const urlValidation = validateUrl(url);
+    if (!urlValidation.valid || !urlValidation.normalizedUrl) {
+      return createApiError('INVALID_URL', urlValidation.error || 'Invalid URL provided.', 400);
+    }
+
+    const validUrl = urlValidation.normalizedUrl;
+    let info: YtDlpInfo | undefined;
+
+    // 2. Primary Extraction via yt-dlp with timeout and client abort handling
+    const playerClient = isProduction
+      ? 'youtube:player_client=default,-android_sdkless'
+      : 'youtube:player_client=all';
+
+    const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
+
+    const cliArgs = [
+      '--dump-single-json',
+      '--no-playlist',
+      '--quiet',
+      '--no-warnings',
+      '--ignore-no-formats-error',
+      '--extractor-args',
+      playerClient,
+    ];
+
+    if (!isProduction) {
+      cliArgs.push(
+        '--add-header',
+        'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+        '--add-header',
+        'Referer:https://www.youtube.com/'
+      );
+    }
+
+    if (proxy) {
+      cliArgs.push('--proxy', proxy);
+    }
+    if (cookiesPath) {
+      cliArgs.push('--cookies', cookiesPath);
+    }
+    cliArgs.push(validUrl);
+
+    console.log('[extract] Starting media extraction job...');
+
+    try {
+      const { stdout } = await runCommandWithLifecycle(ytDlpPath, cliArgs, {
+        timeoutMs: TIMEOUT_CONFIG.MAX_EXTRACTION_TIME,
+        clientSignal: req.signal,
+        maxBuffer: 50 * 1024 * 1024,
       });
-      if (stderr) console.warn('[extract] yt-dlp stderr:', stderr);
+
       info = JSON.parse(stdout);
-    } else {
-      // On localhost, use youtube-dl-exec wrapper — player_client=all works fine
-      // on residential IPs without needing --no-check-formats.
-      const args: any = {
-        dumpSingleJson: true,
-        noWarnings: true,
-        extractorArgs: 'youtube:player_client=all',
-        addHeader: [
-          'User-Agent:Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
-          'Referer:https://www.youtube.com/',
-        ],
-      };
-      if (cookiesPath) args.cookies = cookiesPath;
-      info = await youtubedl(url, args) as any;
+    } catch (primaryErr: unknown) {
+      const pErr = primaryErr as { code?: string };
+      if (req.signal.aborted || pErr?.code === 'ECONNABORTED') {
+        return createApiError('CANCELLED', 'Extraction aborted by client.', 499);
+      }
+      if (pErr?.code === 'ETIMEDOUT') {
+        return createApiError('DOWNLOAD_TIMEOUT', 'Media extraction timed out.', 504);
+      }
+
+      console.warn('[extract] Primary extraction via yt-dlp failed. Attempting fallback via ytdl-core...');
+
+      // 3. Fallback extraction via @distube/ytdl-core
+      try {
+        const ytdlInfo = await ytdl.getInfo(validUrl);
+        const title = sanitizeFilename(ytdlInfo.videoDetails.title || 'Video', 'video');
+        const thumbnail =
+          ytdlInfo.videoDetails.thumbnails?.[ytdlInfo.videoDetails.thumbnails.length - 1]?.url || null;
+
+        const encodedUrl = encodeURIComponent(validUrl);
+        const encodedTitle = encodeURIComponent(title);
+        const options = [];
+        let idCounter = 1;
+
+        const videoHeights = new Set<number>();
+        (ytdlInfo.formats || []).forEach((f) => {
+          if (f.hasVideo && f.height) {
+            videoHeights.add(f.height);
+          }
+        });
+
+        const sortedHeights = Array.from(videoHeights).sort((a, b) => b - a);
+
+        for (const height of sortedHeights) {
+          const formatStr = encodeURIComponent(
+            `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`
+          );
+          options.push({
+            id: idCounter++,
+            quality: `${height}p`,
+            format: 'MP4',
+            size: '—',
+            type: 'video',
+            url: `/api/download?url=${encodedUrl}&type=video&quality=${height}p&format=${formatStr}&title=${encodedTitle}`,
+          });
+        }
+
+        if (options.length === 0) {
+          const formatStr = encodeURIComponent('bestvideo+bestaudio/best');
+          options.push({
+            id: idCounter++,
+            quality: 'Best Available',
+            format: 'MP4',
+            size: '—',
+            type: 'video',
+            url: `/api/download?url=${encodedUrl}&type=video&quality=best&format=${formatStr}&title=${encodedTitle}`,
+          });
+        }
+
+        const audioFormatStr = encodeURIComponent('bestaudio[ext=m4a]/bestaudio');
+        options.push({
+          id: idCounter++,
+          quality: 'Audio Only',
+          format: 'M4A',
+          size: '—',
+          type: 'audio',
+          url: `/api/download?url=${encodedUrl}&type=audio&format=${audioFormatStr}&title=${encodedTitle}`,
+        });
+        options.push({
+          id: idCounter++,
+          quality: 'MP3 (192 kbps)',
+          format: 'MP3',
+          size: '—',
+          type: 'audio',
+          url: `/api/download?url=${encodedUrl}&type=audio&format=mp3&bitrate=192k&title=${encodedTitle}`,
+        });
+
+        console.log('[extract] Fallback extraction succeeded.');
+        return NextResponse.json({
+          title,
+          thumbnail,
+          options,
+        });
+      } catch {
+        // Both primary and fallback failed; sanitize client error message
+        return createApiError('EXTRACTION_FAILED', 'Failed to extract media information from URL.', 500);
+      }
     }
 
-    const encodedUrl = encodeURIComponent(url);
-    const encodedTitle = encodeURIComponent(info.title || 'video');
+    if (!info) {
+      return createApiError('EXTRACTION_FAILED', 'Failed to extract media information from URL.', 500);
+    }
+
+    const safeTitle = sanitizeFilename(info.title || 'video', 'video');
+    const encodedUrl = encodeURIComponent(validUrl);
+    const encodedTitle = encodeURIComponent(safeTitle);
     const options = [];
     let idCounter = 1;
 
-    // Parse real video formats and deduplicate by resolution
-    const formats: any[] = info.formats || [];
-
-    // Get all unique heights that have video formats
+    // Parse video formats and deduplicate by height
+    const formats: YtDlpFormat[] = info?.formats || [];
     const videoHeights = new Set<number>();
-    formats.forEach((f: any) => {
+    formats.forEach((f: YtDlpFormat) => {
       if (f.vcodec && f.vcodec !== 'none' && f.height) {
         videoHeights.add(f.height);
       }
     });
 
-    // Sort heights descending (4K → 1080p → 720p → 480p → 360p)
     const sortedHeights = Array.from(videoHeights).sort((a, b) => b - a);
 
-    // Find best audio format to add its size to the estimate
+    // Audio size estimation
     const bestAudio = formats
-      .filter((f: any) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
-      .sort((a: any, b: any) => (b.abr || 0) - (a.abr || 0))[0];
+      .filter((f: YtDlpFormat) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+      .sort((a: YtDlpFormat, b: YtDlpFormat) => (b.abr || 0) - (a.abr || 0))[0];
     const audioSizeBytes = bestAudio?.filesize || bestAudio?.filesize_approx || 0;
 
     for (const height of sortedHeights) {
-      // Find the best video-only format at this exact height for size estimation
       const videoSample = formats
-        .filter((f: any) => f.height === height && f.vcodec && f.vcodec !== 'none')
-        .sort((a: any, b: any) => (b.filesize || b.filesize_approx || 0) - (a.filesize || a.filesize_approx || 0))[0];
+        .filter((f: YtDlpFormat) => f.height === height && f.vcodec && f.vcodec !== 'none')
+        .sort((a: YtDlpFormat, b: YtDlpFormat) => (b.filesize || b.filesize_approx || 0) - (a.filesize || a.filesize_approx || 0))[0];
 
       const videoSizeBytes = videoSample?.filesize || videoSample?.filesize_approx || 0;
-      // Combined size = video + audio (both streams get merged)
       const totalBytes = videoSizeBytes + audioSizeBytes;
       const sizeMB = totalBytes > 0 ? `~${(totalBytes / (1024 * 1024)).toFixed(0)} MB` : '—';
 
-      // CRITICAL: Encode '+' as '%2B' so URL parsers don't treat it as a space!
       const formatStr = encodeURIComponent(`bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`);
 
       options.push({
@@ -132,11 +241,10 @@ export async function POST(req: Request) {
         format: 'MP4',
         size: sizeMB,
         type: 'video',
-        url: `/api/download?url=${encodedUrl}&format=${formatStr}&title=${encodedTitle}`,
+        url: `/api/download?url=${encodedUrl}&type=video&quality=${height}p&format=${formatStr}&title=${encodedTitle}`,
       });
     }
 
-    // If no video formats found, fall back to generic best
     if (options.length === 0) {
       const formatStr = encodeURIComponent('bestvideo+bestaudio/best');
       options.push({
@@ -145,101 +253,36 @@ export async function POST(req: Request) {
         format: 'MP4',
         size: '—',
         type: 'video',
-        url: `/api/download?url=${encodedUrl}&format=${formatStr}&title=${encodedTitle}`,
+        url: `/api/download?url=${encodedUrl}&type=video&quality=best&format=${formatStr}&title=${encodedTitle}`,
       });
     }
 
-    // Audio Only — encode the format to be safe
     const audioFormatStr = encodeURIComponent('bestaudio[ext=m4a]/bestaudio');
     options.push({
       id: idCounter++,
       quality: 'Audio Only',
+      format: 'M4A',
+      size: audioSizeBytes > 0 ? `~${(audioSizeBytes / (1024 * 1024)).toFixed(0)} MB` : '—',
+      type: 'audio',
+      url: `/api/download?url=${encodedUrl}&type=audio&format=${audioFormatStr}&title=${encodedTitle}`,
+    });
+    options.push({
+      id: idCounter++,
+      quality: 'MP3 (192 kbps)',
       format: 'MP3',
       size: audioSizeBytes > 0 ? `~${(audioSizeBytes / (1024 * 1024)).toFixed(0)} MB` : '—',
       type: 'audio',
-      url: `/api/download?url=${encodedUrl}&format=${audioFormatStr}&title=${encodedTitle}`,
+      url: `/api/download?url=${encodedUrl}&type=audio&format=mp3&bitrate=192k&title=${encodedTitle}`,
     });
 
+    console.log('[extract] Media metadata extracted successfully.');
     return NextResponse.json({
-      title: info.title || 'Unknown Video',
+      title: safeTitle,
       thumbnail: info.thumbnail || null,
-      options
+      options,
     });
-
-  } catch (error: any) {
-    console.error('[extract] Primary extraction (yt-dlp) failed:', {
-      message: error?.message,
-      stderr: error?.stderr,
-      code: error?.code,
-    });
-
-    console.log('[extract] Attempting fallback extraction via @distube/ytdl-core...');
-    try {
-      const { url } = await req.clone().json();
-      const ytdlInfo = await ytdl.getInfo(url);
-
-      const title = ytdlInfo.videoDetails.title || 'Video';
-      const thumbnail = ytdlInfo.videoDetails.thumbnails?.[ytdlInfo.videoDetails.thumbnails.length - 1]?.url || null;
-
-      const encodedUrl = encodeURIComponent(url);
-      const encodedTitle = encodeURIComponent(title);
-      const options = [];
-      let idCounter = 1;
-
-      const videoHeights = new Set<number>();
-      (ytdlInfo.formats || []).forEach((f: any) => {
-        if (f.hasVideo && f.height) {
-          videoHeights.add(f.height);
-        }
-      });
-
-      const sortedHeights = Array.from(videoHeights).sort((a, b) => b - a);
-
-      for (const height of sortedHeights) {
-        const formatStr = encodeURIComponent(`bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`);
-        options.push({
-          id: idCounter++,
-          quality: `${height}p`,
-          format: 'MP4',
-          size: '—',
-          type: 'video',
-          url: `/api/download?url=${encodedUrl}&format=${formatStr}&title=${encodedTitle}`,
-        });
-      }
-
-      if (options.length === 0) {
-        const formatStr = encodeURIComponent('bestvideo+bestaudio/best');
-        options.push({
-          id: idCounter++,
-          quality: 'Best Available',
-          format: 'MP4',
-          size: '—',
-          type: 'video',
-          url: `/api/download?url=${encodedUrl}&format=${formatStr}&title=${encodedTitle}`,
-        });
-      }
-
-      const audioFormatStr = encodeURIComponent('bestaudio[ext=m4a]/bestaudio');
-      options.push({
-        id: idCounter++,
-        quality: 'Audio Only',
-        format: 'MP3',
-        size: '—',
-        type: 'audio',
-        url: `/api/download?url=${encodedUrl}&format=${audioFormatStr}&title=${encodedTitle}`,
-      });
-
-      console.log('[extract] Fallback extraction (@distube/ytdl-core) succeeded!');
-      return NextResponse.json({
-        title,
-        thumbnail,
-        options,
-      });
-
-    } catch (fallbackError: any) {
-      console.error('[extract] Fallback extraction (@distube/ytdl-core) also failed:', fallbackError?.message);
-      return NextResponse.json({ error: `Failed to extract media: ${error?.message || error?.stderr || fallbackError?.message || 'Unknown error'}` }, { status: 500 });
-    }
+  } catch {
+    return createApiError('INTERNAL_ERROR', 'An unexpected error occurred during extraction.', 500);
   } finally {
     cleanupCookiesFile(cookiesPath);
   }

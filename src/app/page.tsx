@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 
 type MediaOption = { id: number; quality: string; format: string; size: string; type: string; url: string };
@@ -53,11 +53,23 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadingLabel, setDownloadingLabel] = useState("");
-  const [progress, setProgress] = useState(0);
+  const [progress, setProgress] = useState<number | null>(0);
   const [progressStage, setProgressStage] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [mediaOptions, setMediaOptions] = useState<MediaOption[] | null>(null);
   const [mediaInfo, setMediaInfo] = useState<{ title: string; thumbnail: string | null } | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Clean up polling timer on unmount without cancelling the backend job
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    };
+  }, []);
 
   const handleExtract = async () => {
     if (!url.trim()) return;
@@ -71,89 +83,141 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to extract video");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || data.error || "Failed to extract media.");
       setMediaInfo({ title: data.title, thumbnail: data.thumbnail });
-      setMediaOptions(data.options);
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const e = err as { message?: string };
       console.error("Extraction error:", err);
-      setError("Srever is busy");
+      setError(e?.message || "Server is busy. Please try again.");
     } finally {
       setIsLoading(false);
     }
   };
 
+  const handleCancelJob = async () => {
+    if (activeJobId) {
+      try {
+        await fetch(`/api/download/${activeJobId}`, { method: "DELETE" });
+      } catch (e) {
+        console.warn("Failed to cancel job:", e);
+      }
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    setIsDownloading(false);
+    setActiveJobId(null);
+    setProgress(0);
+  };
+
   const handleFormatDownload = async (opt: MediaOption) => {
     setIsDownloading(true);
-    setProgress(0);
-    setProgressStage("Connecting to server...");
+    setProgress(5);
+    setProgressStage("Creating download job...");
     setDownloadingLabel(`${opt.quality} ${opt.type === "audio" ? "Audio" : "Video"}`);
 
-    // Simulate realistic server-side processing progress (download + merge takes time before bytes flow)
-    let serverProgress = 0;
-    const stages = [
-      { target: 40, ms: 18000, label: "Downloading video stream..." },
-      { target: 78, ms: 10000, label: "Downloading audio stream..." },
-      { target: 94, ms: 6000, label: "Video and Audio Files Merging..." },
-      { target: 99, ms: 4000, label: "Finalizing file..." },
-    ];
-    let si = 0, stageStart = Date.now(), stageBase = 0;
-    const fakeTimer = setInterval(() => {
-      if (si >= stages.length) return;
-      const s = stages[si];
-      const frac = Math.min((Date.now() - stageStart) / s.ms, 1);
-      const eased = 1 - Math.pow(1 - frac, 2);
-      serverProgress = stageBase + (s.target - stageBase) * eased;
-      setProgress(Math.round(serverProgress));
-      setProgressStage(s.label);
-      if (frac >= 1) { si++; stageStart = Date.now(); stageBase = s.target; }
-    }, 80);
-
     try {
-      const response = await fetch(opt.url);
-      clearInterval(fakeTimer);
+      const parsed = new URL(opt.url, window.location.origin);
+      const payload = {
+        url: parsed.searchParams.get("url"),
+        type: parsed.searchParams.get("type"),
+        quality: parsed.searchParams.get("quality"),
+        format: parsed.searchParams.get("format"),
+        title: parsed.searchParams.get("title"),
+      };
 
-      if (!response.ok) throw new Error("Server returned an error. Please try again.");
-      if (!response.body) throw new Error("No response body received.");
+      const res = await fetch("/api/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-      // Read the actual response bytes and track real download progress
-      const contentLength = response.headers.get("content-length");
-      const total = contentLength ? parseInt(contentLength, 10) : 0;
-      const reader = response.body.getReader();
-      const chunks: BlobPart[] = [];
-      let received = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value as BlobPart);
-        received += value?.length ?? 0;
-        setProgressStage("Transferring file to browser...");
-        setProgress(total > 0 ? Math.round((received / total) * 100) : 99);
+      const jobData = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(jobData.message || jobData.error || "Failed to start download job.");
       }
 
-      setProgress(100);
-      setProgressStage("Download complete! 🎉");
+      const jobId = jobData.jobId;
+      setActiveJobId(jobId);
+      setProgress(jobData.progress || 10);
+      setProgressStage(jobData.stage || "Download job started...");
 
-      // Combine chunks and trigger browser save dialog
-      const contentType = response.headers.get("content-type") || "video/mp4";
-      const blob = new Blob(chunks, { type: contentType });
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = `${(mediaInfo?.title || "download").replace(/[^a-z0-9]/gi, "_")}.${opt.type === "audio" ? "mp3" : "mp4"}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(blobUrl);
+      // Poll status every 1500ms (clear any previous timer to prevent duplicates)
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
 
-      await new Promise((r) => setTimeout(r, 1200));
-    } catch (err: any) {
-      clearInterval(fakeTimer);
+      await new Promise<void>((resolve, reject) => {
+        pollIntervalRef.current = setInterval(async () => {
+          try {
+            const statusRes = await fetch(`/api/download/${jobId}/status`);
+            if (!statusRes.ok) {
+              const errData = await statusRes.json().catch(() => ({}));
+              throw new Error(errData.message || "Failed to query download status.");
+            }
+            const statusData = await statusRes.json();
+
+            if (statusData.stage) setProgressStage(statusData.stage);
+            if (typeof statusData.progress === "number") {
+              setProgress(statusData.progress);
+            } else if (statusData.progress === null) {
+              setProgress(null);
+            }
+
+            if (statusData.status === "ready") {
+              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+
+              setProgress(100);
+              setProgressStage("Download ready! Transferring file... 🎉");
+
+              // Native browser download triggered directly from server stream (Zero client Blob memory buffering)
+              const downloadUrl = statusData.downloadUrl || `/api/download/${jobId}`;
+              const a = document.createElement("a");
+              a.href = downloadUrl;
+              a.download = statusData.fileName || `${(mediaInfo?.title || "download").replace(/[^a-z0-9]/gi, "_")}.${opt.type === "audio" ? "m4a" : "mp4"}`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+
+              setTimeout(() => {
+                setIsDownloading(false);
+                setActiveJobId(null);
+                setProgress(0);
+                resolve();
+              }, 1500);
+
+            } else if (statusData.status === "failed") {
+              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+              reject(new Error(statusData.error?.message || "The download job failed."));
+            } else if (statusData.status === "cancelled" || statusData.status === "expired") {
+              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+              setIsDownloading(false);
+              setActiveJobId(null);
+              setProgress(0);
+              resolve();
+            }
+          } catch (pollErr) {
+            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+            reject(pollErr);
+          }
+        }, 1500);
+      });
+
+    } catch (err: unknown) {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+      const e = err as { message?: string };
       console.error("Download error:", err);
-      setError("Srever is busy");
-    } finally {
+      setError(e?.message || "Server is busy. Please try again.");
       setIsDownloading(false);
+      setActiveJobId(null);
       setProgress(0);
     }
   };
@@ -192,13 +256,15 @@ export default function Home() {
             <div className="w-full flex flex-col gap-2">
               <div className="flex justify-between items-center text-xs font-medium">
                 <span className="text-slate-400">{progressStage}</span>
-                <span className="text-white tabular-nums">{progress}%</span>
+                <span className="text-white tabular-nums">
+                  {typeof progress === "number" ? `${progress}%` : "Processing..."}
+                </span>
               </div>
               <div className="w-full h-3 rounded-full bg-white/10 overflow-hidden">
                 <div
                   className="h-full rounded-full relative overflow-hidden transition-all duration-300 ease-out"
                   style={{
-                    width: `${progress}%`,
+                    width: typeof progress === "number" ? `${progress}%` : "100%",
                     background: "linear-gradient(90deg, #7c3aed, #2563eb, #7c3aed)",
                     backgroundSize: "200% 100%",
                     animation: "shimmer 2s linear infinite",
@@ -210,10 +276,19 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Hint */}
-            <p className="text-slate-500 text-xs text-center leading-relaxed">
-              Merging HD video &amp; audio on the server.<br />File saves automatically when ready.
-            </p>
+            {/* Hint & Cancel Button */}
+            <div className="flex flex-col items-center gap-2">
+              <p className="text-slate-500 text-xs text-center leading-relaxed">
+                Merging HD video &amp; audio on the server.<br />File saves automatically when ready.
+              </p>
+              <button
+                type="button"
+                onClick={handleCancelJob}
+                className="text-xs text-slate-400 hover:text-red-400 underline transition-colors cursor-pointer pt-1"
+              >
+                Cancel Download
+              </button>
+            </div>
           </div>
         </div>
       )}

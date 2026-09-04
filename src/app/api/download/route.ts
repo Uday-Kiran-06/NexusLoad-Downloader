@@ -1,12 +1,16 @@
 import { NextResponse } from 'next/server';
-import { create } from 'youtube-dl-exec';
-import ffmpeg from 'fluent-ffmpeg';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
 
-// Construct all binary paths dynamically depending on target OS, with fallback to global installations
+import { validateUrlForDownload, validateAndMapFormat, sanitizeFilename, sanitizeMetadata, parseBoundedJson, SUPPORTED_MP3_BITRATES } from '@/lib/validation';
+import { checkDiskSpace } from '@/lib/concurrency';
+import { createApiError, ApiErrorCode } from '@/lib/errors';
+import { createJob } from '@/lib/job-manager';
+import { checkRateLimit, getClientIdentifier } from '@/lib/rate-limiter';
+import { logOperationalEvent } from '@/lib/logger';
+
+// Binary path resolution
 const isWin = os.platform() === 'win32';
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -17,172 +21,238 @@ const localYtDlp = path.join(
   'bin',
   isWin ? 'yt-dlp.exe' : 'yt-dlp'
 );
-// Use local binary if it exists (nixpacks build downloads the latest yt-dlp
-// binary here during Render deployment), otherwise fall back to system PATH.
 const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
-
-const localFfmpeg = path.join(
-  process.cwd(),
-  'node_modules',
-  'ffmpeg-static',
-  isWin ? 'ffmpeg.exe' : 'ffmpeg'
-);
-const ffmpegPath = fs.existsSync(localFfmpeg) ? localFfmpeg : 'ffmpeg';
-
-const youtubedl = create(ytDlpPath);
-ffmpeg.setFfmpegPath(ffmpegPath);
 
 export const dynamic = 'force-dynamic';
 
-// Helper to clean up temp directories safely, handling EBUSY lock errors by retrying after a short delay
-function safeCleanup(dir: string) {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch (e) {
-    console.warn(`[download] Initial cleanup of ${dir} failed (resource busy/locked). Retrying in 5s...`);
-    setTimeout(() => {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-        console.log(`[download] Delayed cleanup of ${dir} succeeded.`);
-      } catch (retryError) {
-        // Ignore silent failure on retry to prevent crashing
-      }
-    }, 5000);
+const ALLOWED_DOWNLOAD_KEYS = new Set([
+  'url',
+  'type',
+  'quality',
+  'format',
+  'title',
+  'bitrate',
+  'artist',
+  'album',
+  'date',
+]);
+
+async function handleDownloadJobCreation(
+  req: Request,
+  params: {
+    rawUrl: unknown;
+    rawType: unknown;
+    rawQuality: unknown;
+    rawFormat: unknown;
+    rawTitle: unknown;
+    rawBitrate?: unknown;
+    rawArtist?: unknown;
+    rawAlbum?: unknown;
+    rawDate?: unknown;
   }
-}
-
-export async function GET(req: Request) {
-  const cookiesPath = getCookiesPath();
-  const { searchParams } = new URL(req.url);
-  const url = searchParams.get('url');
-  const format = searchParams.get('format') || 'best';
-  const title = searchParams.get('title') || 'media_download';
-
-  if (!url) return new NextResponse('Invalid URL', { status: 400 });
-
-  const isAudioOnly = format.includes('bestaudio') && !format.includes('bestvideo');
-  const safeTitle = title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-  const tmpDir = path.join(os.tmpdir(), `ytdl_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  try {
-    // Select player client based on environment:
-
-    // - 'all' works on localhost (residential IP)
-    // - 'default,-android_sdkless' bypasses datacenter IP blocks on Render/cloud
-    const isProduction = process.env.NODE_ENV === 'production';
-    const desktopUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-    const extractorArgs = isProduction
-      ? 'youtube:player_client=default,-android_sdkless'
-      : 'youtube:player_client=all';
-
-    const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
-
-    const commonArgs: any = {
-      noWarnings: true,
-      extractorArgs,
-      concurrentFragments: 8,
-      bufferSize: '16K',
-    };
-    if (proxy) {
-      commonArgs.proxy = proxy;
-    }
-    if (cookiesPath) {
-      commonArgs.cookies = cookiesPath;
-    }
-
-    if (isAudioOnly) {
-      // ── Audio only: single download, no merge needed ──────────────────────
-      const audioFile = path.join(tmpDir, 'audio.%(ext)s');
-      await youtubedl(url, { ...commonArgs, output: audioFile, format: 'bestaudio[ext=m4a]/bestaudio' });
-
-      const files = fs.readdirSync(tmpDir).filter(f => !f.endsWith('.part'));
-      if (files.length === 0) throw new Error('Audio download failed — no file created');
-
-      const outPath = path.join(tmpDir, files[0]);
-      const ext = path.extname(files[0]).replace('.', '') || 'm4a';
-      const buf = fs.readFileSync(outPath);
-      safeCleanup(tmpDir);
-
-      return new NextResponse(buf, {
-        headers: {
-          'Content-Type': 'audio/mp4',
-          'Content-Disposition': `attachment; filename="${safeTitle}.${ext}"`,
-          'Content-Length': String(buf.length),
-        },
-      });
-
-    } else {
-      // ── Video: download streams separately, merge with fluent-ffmpeg ───────
-
-      // Parse height from format string e.g. "bestvideo[height<=1080]+bestaudio/..."
-      const heightMatch = format.match(/height<=(\d+)/);
-      const height = heightMatch ? heightMatch[1] : '1080';
-
-      const videoFile = path.join(tmpDir, 'video.mp4');
-      const audioFile = path.join(tmpDir, 'audio.m4a');
-      const mergedFile = path.join(tmpDir, 'merged.mp4');
-
-      console.log(`[download] Downloading video (${height}p) and audio separately...`);
-
-      // Download video-only and audio-only streams in parallel.
-      // Use permissive format strings without [ext=mp4] — tv_embedded/ios may
-      // serve webm/av1/other containers which get muxed into mp4 by ffmpeg.
-      await Promise.all([
-        youtubedl(url, { ...commonArgs, output: videoFile, format: `bestvideo[height<=${height}]/bestvideo` }),
-        youtubedl(url, { ...commonArgs, output: audioFile, format: 'bestaudio[ext=m4a]/bestaudio/best' }),
-      ]);
-
-      // Find the actual downloaded video file (yt-dlp may change the filename)
-      const videoFiles = fs.readdirSync(tmpDir).filter(f => f.startsWith('video') && !f.endsWith('.part'));
-      const audioFiles = fs.readdirSync(tmpDir).filter(f => f.startsWith('audio') && !f.endsWith('.part'));
-
-      if (videoFiles.length === 0) throw new Error('Video stream download failed');
-      if (audioFiles.length === 0) throw new Error('Audio stream download failed');
-
-      const actualVideoFile = path.join(tmpDir, videoFiles[0]);
-      const actualAudioFile = path.join(tmpDir, audioFiles[0]);
-
-      console.log(`[download] Merging: ${videoFiles[0]} + ${audioFiles[0]}`);
-
-      // Merge with fluent-ffmpeg (uses our local ffmpeg-static binary)
-      await new Promise<void>((resolve, reject) => {
-        ffmpeg()
-          .input(actualVideoFile)
-          .input(actualAudioFile)
-          .outputOptions(['-c:v copy', '-c:a copy', '-movflags +faststart']) // copy audio — no re-encode, near-instant
-          .output(mergedFile)
-          .on('end', () => resolve())
-          .on('error', (err) => reject(err))
-          .run();
-      });
-
-      const buf = fs.readFileSync(mergedFile);
-      safeCleanup(tmpDir);
-
-      return new NextResponse(buf, {
-        headers: {
-          'Content-Type': 'video/mp4',
-          'Content-Disposition': `attachment; filename="${safeTitle}.mp4"`,
-          'Content-Length': String(buf.length),
-        },
-      });
-    }
-
-  } catch (error: any) {
-    safeCleanup(tmpDir);
-    console.error('Download route error details:', {
-      message: error?.message,
-      stderr: error?.stderr,
-      stdout: error?.stdout,
-      code: error?.code,
+): Promise<NextResponse> {
+  // 1. Rate Limiting Check
+  const rateLimit = checkRateLimit(req, 'download');
+  if (!rateLimit.allowed) {
+    logOperationalEvent({
+      event: 'rate_limit_rejected',
+      clientIp: getClientIdentifier(req),
+      reason: 'Download rate limit exceeded.',
+      status: 429,
+      limit: rateLimit.limit,
+      remaining: rateLimit.remaining,
     });
-    const msg = error?.stderr || error?.message || String(error);
-    return new NextResponse('Failed: ' + msg, { status: 500 });
-  } finally {
-    cleanupCookiesFile(cookiesPath);
+    return createApiError(
+      'RATE_LIMITED',
+      `Download request limit reached. Please try again in ${rateLimit.retryAfterSec} seconds.`,
+      429,
+      { 'Retry-After': String(rateLimit.retryAfterSec) }
+    );
   }
+
+  // 2. Strict Input Type & Value Validation
+  const { rawUrl, rawType, rawQuality, rawFormat, rawTitle, rawBitrate, rawArtist, rawAlbum, rawDate } = params;
+
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    return createApiError('INVALID_REQUEST', 'Missing or invalid required parameter: url.', 400);
+  }
+  if (rawUrl.length > 2048) {
+    return createApiError('INVALID_URL', 'URL exceeds maximum length of 2048 characters.', 400);
+  }
+
+  if (rawType !== undefined && rawType !== null) {
+    if (typeof rawType !== 'string' || (rawType !== 'audio' && rawType !== 'video')) {
+      return createApiError('INVALID_REQUEST', "Invalid 'type' value. Allowed: 'audio' or 'video'.", 400);
+    }
+  }
+
+  if (rawBitrate !== undefined && rawBitrate !== null) {
+    if (typeof rawBitrate !== 'string' || !(SUPPORTED_MP3_BITRATES as readonly string[]).includes(rawBitrate.toLowerCase())) {
+      return createApiError(
+        'INVALID_FORMAT',
+        `Invalid or unsupported MP3 bitrate. Supported: ${SUPPORTED_MP3_BITRATES.join(', ')}.`,
+        400
+      );
+    }
+  }
+
+  for (const [name, val, maxLen] of [
+    ['title', rawTitle, 500],
+    ['artist', rawArtist, 500],
+    ['album', rawAlbum, 500],
+    ['date', rawDate, 32],
+  ] as const) {
+    if (val !== undefined && val !== null) {
+      if (typeof val !== 'string') {
+        return createApiError('INVALID_REQUEST', `Parameter '${name}' must be a string.`, 400);
+      }
+      if (val.length > maxLen) {
+        return createApiError('INVALID_REQUEST', `Parameter '${name}' exceeds maximum length of ${maxLen} characters.`, 400);
+      }
+    }
+  }
+
+  // 3. Server-side URL Validation with DNS-aware SSRF protection
+  // PROXY POLICY: Direct downloads reject private/internal IP ranges. Outbound proxy
+  // configuration (YT_PROXY / HTTP_PROXY) remains server-administered and untrusted from clients.
+  const urlValidation = await validateUrlForDownload(rawUrl);
+  if (!urlValidation.valid || !urlValidation.normalizedUrl) {
+    logOperationalEvent({
+      event: 'ssrf_rejected',
+      clientIp: getClientIdentifier(req),
+      reason: urlValidation.error || 'SSRF check failed.',
+      status: 400,
+    });
+    return createApiError('INVALID_URL', urlValidation.error || 'Invalid URL provided.', 400);
+  }
+  const validUrl = urlValidation.normalizedUrl;
+
+  // 4. Format & Quality Validation
+  const formatValidation = validateAndMapFormat({
+    type: typeof rawType === 'string' ? rawType : null,
+    quality: typeof rawQuality === 'string' ? rawQuality : null,
+    format: typeof rawFormat === 'string' ? rawFormat : null,
+    bitrate: typeof rawBitrate === 'string' ? rawBitrate : null,
+  });
+  if (!formatValidation.valid) {
+    return createApiError('INVALID_FORMAT', formatValidation.error || 'Invalid format requested.', 400);
+  }
+
+  // 5. Safe Filename and Metadata Handling
+  const safeTitle = sanitizeFilename(rawTitle, 'media_download');
+  const safeArtist = sanitizeMetadata(rawArtist, 500) || undefined;
+  const safeAlbum = sanitizeMetadata(rawAlbum, 500) || undefined;
+  const safeDate = sanitizeMetadata(rawDate, 32) || undefined;
+
+  // 6. Proactive Disk Space Check
+  const disk = await checkDiskSpace();
+  if (!disk.ok) {
+    return createApiError(
+      'DISK_SPACE',
+      'Insufficient temporary storage space on server to process this download.',
+      507
+    );
+  }
+
+  // 7. Job Creation & Concurrency Slot Acquisition
+  const { job, error } = createJob({
+    validUrl,
+    formatValidation,
+    safeTitle,
+    ytDlpPath,
+    isProduction,
+    metadata: {
+      title: safeTitle,
+      artist: safeArtist,
+      album: safeAlbum,
+      date: safeDate,
+    },
+  });
+
+  if (error || !job) {
+    return createApiError(
+      (error?.code as ApiErrorCode) || 'SERVER_BUSY',
+      error?.message || 'Server is currently busy. Please try again later.',
+      error?.status || 429
+    );
+  }
+
+  return NextResponse.json(
+    {
+      jobId: job.id,
+      status: job.status,
+      stage: job.stage,
+      progress: job.progress,
+      downloadUrl: `/api/download/${job.id}`,
+      statusUrl: `/api/download/${job.id}/status`,
+    },
+    {
+      status: 202,
+      headers: {
+        'X-Content-Type-Options': 'nosniff',
+      },
+    }
+  );
 }
 
+/**
+ * POST /api/download
+ * Creates a background download job with bounded memory execution.
+ */
+export async function POST(req: Request) {
+  // Bounded JSON parsing: rejects oversized body (> 16KB), non-JSON content-types, and malformed syntax early
+  const parseResult = await parseBoundedJson<Record<string, unknown>>(req);
+  if (parseResult.error) {
+    return createApiError(parseResult.error.code, parseResult.error.message, parseResult.error.status);
+  }
 
+  const body = parseResult.data || {};
+
+  // Strict allowlist: reject any unexpected / unrecognized parameters
+  for (const key of Object.keys(body)) {
+    if (!ALLOWED_DOWNLOAD_KEYS.has(key)) {
+      return createApiError('INVALID_REQUEST', `Unexpected field '${key}' in request body.`, 400);
+    }
+  }
+
+  const { searchParams } = new URL(req.url);
+
+  return handleDownloadJobCreation(req, {
+    rawUrl: body?.url || searchParams.get('url'),
+    rawType: body?.type || searchParams.get('type'),
+    rawQuality: body?.quality || searchParams.get('quality'),
+    rawFormat: body?.format || searchParams.get('format'),
+    rawTitle: body?.title || searchParams.get('title'),
+    rawBitrate: body?.bitrate || searchParams.get('bitrate'),
+    rawArtist: body?.artist || searchParams.get('artist'),
+    rawAlbum: body?.album || searchParams.get('album'),
+    rawDate: body?.date || searchParams.get('date'),
+  });
+}
+
+/**
+ * GET /api/download
+ * Direct GET route that creates a background download job for backwards compatibility.
+ */
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+
+  // Validate allowed query keys
+  for (const key of searchParams.keys()) {
+    if (!ALLOWED_DOWNLOAD_KEYS.has(key)) {
+      return createApiError('INVALID_REQUEST', `Unexpected query parameter '${key}'.`, 400);
+    }
+  }
+
+  return handleDownloadJobCreation(req, {
+    rawUrl: searchParams.get('url'),
+    rawType: searchParams.get('type'),
+    rawQuality: searchParams.get('quality'),
+    rawFormat: searchParams.get('format'),
+    rawTitle: searchParams.get('title'),
+    rawBitrate: searchParams.get('bitrate'),
+    rawArtist: searchParams.get('artist'),
+    rawAlbum: searchParams.get('album'),
+    rawDate: searchParams.get('date'),
+  });
+}

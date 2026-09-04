@@ -6,7 +6,8 @@
     "dev": "next dev --webpack",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "npx tsx tests/phase4_1.test.mjs && npx tsx tests/phase5.test.mjs && npx tsx tests/phase6.test.mjs"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

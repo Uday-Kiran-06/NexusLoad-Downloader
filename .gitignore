@@ -43,3 +43,6 @@ next-env.d.ts
 # temp player scripts
 *-player-script.js
 
+# scratch scripts
+/scratch/
+
