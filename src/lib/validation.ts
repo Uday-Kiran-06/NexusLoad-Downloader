@@ -274,24 +274,126 @@ export function validateAndMapFormat(params: {
   type?: string | null;
   quality?: string | null;
   format?: string | null;
+  formatId?: string | null;
   bitrate?: string | null;
 }): ValidatedFormat {
-  const { type, quality, format, bitrate } = params;
+  let { type, quality, format, formatId, bitrate } = params;
 
-  // Reject any obvious injection attempts across all parameters
-  const dangerousPattern = /[;\|\&`\$\(\)\{\}\<\>\\"'!\n\r]|--/;
+  // Pre-normalize friendly client UI quality labels before injection checks
+  // e.g. "MP3 (192 kbps)" -> type 'audio', format 'mp3', bitrate '192k'
+  // e.g. "Audio Only" -> type 'audio', quality null
+  // e.g. "Best Available" -> quality 'best'
+  if (typeof quality === 'string') {
+    const trimmedQ = quality.trim();
+    const mp3DisplayMatch = trimmedQ.match(/^mp3(?:\s*\(\s*(\d+)\s*(?:k|kbps)?\s*\)|\s*(\d+)\s*(?:k|kbps)?)?$/i);
+    if (mp3DisplayMatch) {
+      type = type || 'audio';
+      format = format || 'mp3';
+      const extractedNumber = mp3DisplayMatch[1] || mp3DisplayMatch[2];
+      if (extractedNumber) {
+        bitrate = bitrate || `${extractedNumber}k`.toLowerCase();
+      }
+      quality = null;
+    } else if (/^audio(?:\s+only)?$/i.test(trimmedQ)) {
+      type = type || 'audio';
+      quality = null;
+    } else if (/^best(?:\s+available)?$/i.test(trimmedQ)) {
+      quality = 'best';
+    }
+  }
+
+  // Reject any obvious injection attempts or traversal across all parameters
+  const dangerousPattern = /[;\|\&`\$\(\)\{\}\<\>\\"'!\n\r]|--|\.\./;
   if (
     (type && dangerousPattern.test(type)) ||
     (quality && dangerousPattern.test(quality)) ||
     (format && dangerousPattern.test(format)) ||
+    (formatId && dangerousPattern.test(formatId)) ||
     (bitrate && dangerousPattern.test(bitrate))
   ) {
     return { valid: false, isAudioOnly: false, error: 'Disallowed characters in format request.' };
   }
 
+  // Normalize string inputs
+  type = typeof type === 'string' ? type.toLowerCase().trim() : null;
+  quality = typeof quality === 'string' ? quality.toLowerCase().trim() : null;
+  format = typeof format === 'string' ? format.toLowerCase().trim() : null;
+  formatId = typeof formatId === 'string' ? formatId.toLowerCase().trim() : null;
+  bitrate = typeof bitrate === 'string' ? bitrate.toLowerCase().trim() : null;
+
   // Type parameter validation if present
   if (type && type !== 'audio' && type !== 'video') {
     return { valid: false, isAudioOnly: false, error: `Invalid media type '${type}'. Only 'audio' or 'video' allowed.` };
+  }
+
+  // Resolve formatId into semantic quality/format/type if provided
+  if (formatId) {
+    if (formatId === 'video_best') {
+      quality = quality || 'best';
+      type = type || 'video';
+      format = format || 'mp4';
+    } else {
+      const vidMatch = formatId.match(/^video_(\d+)p?$/);
+      if (vidMatch) {
+        quality = quality || `${vidMatch[1]}p`;
+        type = type || 'video';
+        format = format || 'mp4';
+      } else if (formatId === 'audio_m4a') {
+        type = type || 'audio';
+        format = format || 'm4a';
+        if (quality === 'audio' || quality === 'audio only') quality = null;
+      } else if (formatId === 'audio_webm') {
+        type = type || 'audio';
+        format = format || 'webm';
+        if (quality === 'audio' || quality === 'audio only') quality = null;
+      } else if (formatId === 'audio_mp3') {
+        type = type || 'audio';
+        format = format || 'mp3';
+        if (quality === 'audio' || quality === 'audio only') quality = null;
+      } else {
+        const mp3Match = formatId.match(/^audio_mp3_(\d+k)$/);
+        if (mp3Match) {
+          type = type || 'audio';
+          format = format || 'mp3';
+          bitrate = bitrate || mp3Match[1];
+          if (quality === 'audio' || quality === 'audio only') quality = null;
+        } else {
+          return { valid: false, isAudioOnly: false, error: `Unknown or invalid format ID '${formatId}'.` };
+        }
+      }
+    }
+  }
+
+  // Also resolve format if provided as a semantic identifier (e.g. video_240p, audio_mp3, etc.)
+  if (format) {
+    if (format === 'video_best') {
+      quality = quality || 'best';
+      type = type || 'video';
+      format = 'mp4';
+    } else {
+      const vidMatch = format.match(/^video_(\d+)p?$/);
+      if (vidMatch) {
+        quality = quality || `${vidMatch[1]}p`;
+        type = type || 'video';
+        format = 'mp4';
+      } else if (format === 'audio_m4a') {
+        type = type || 'audio';
+        format = 'm4a';
+      } else if (format === 'audio_webm') {
+        type = type || 'audio';
+        format = 'webm';
+      } else if (format === 'audio_mp3') {
+        type = type || 'audio';
+        format = 'mp3';
+      } else {
+        const mp3Match = format.match(/^audio_mp3_(\d+k)$/);
+        if (mp3Match) {
+          type = type || 'audio';
+          format = 'mp3';
+          bitrate = bitrate || mp3Match[1];
+        }
+      }
+    }
   }
 
   // Reject video with MP3 or audio bitrate
@@ -303,19 +405,18 @@ export function validateAndMapFormat(params: {
   }
 
   // Reject video quality requested with MP3 format or audio bitrate
-  const isVideoQuality = quality && SUPPORTED_VIDEO_HEIGHTS.some((h) => quality.toLowerCase() === `${h}p` || quality === String(h));
+  const isVideoQuality = quality && SUPPORTED_VIDEO_HEIGHTS.some((h) => quality === `${h}p` || quality === String(h));
   if (isVideoQuality && (format === 'mp3' || bitrate)) {
     return { valid: false, isAudioOnly: false, error: 'Invalid format combination: video resolution with MP3 format/bitrate.' };
   }
 
-function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
-  return (SUPPORTED_MP3_BITRATES as readonly string[]).includes(val);
-}
+  function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
+    return (SUPPORTED_MP3_BITRATES as readonly string[]).includes(val);
+  }
 
   // Check if explicit bitrate was provided in params
   if (bitrate) {
-    const cleanB = bitrate.toLowerCase().trim();
-    if (!isSupportedMp3Bitrate(cleanB)) {
+    if (!isSupportedMp3Bitrate(bitrate)) {
       return {
         valid: false,
         isAudioOnly: false,
@@ -325,8 +426,8 @@ function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
   }
 
   // Reject contradictory combinations (audio with video quality)
-  if (type === 'audio' && quality && quality !== 'audio' && quality !== 'best') {
-    const isBitrate = isSupportedMp3Bitrate(quality.toLowerCase());
+  if (type === 'audio' && quality && quality !== 'audio' && quality !== 'audio only' && quality !== 'best') {
+    const isBitrate = isSupportedMp3Bitrate(quality);
     if (!isBitrate) {
       if (/^\d+k$/i.test(quality)) {
         return {
@@ -338,7 +439,7 @@ function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
       return { valid: false, isAudioOnly: false, error: 'Invalid format combination: audio request with video quality.' };
     }
   }
-  if (type === 'video' && quality === 'audio') {
+  if (type === 'video' && (quality === 'audio' || quality === 'audio only')) {
     return { valid: false, isAudioOnly: false, error: 'Invalid format combination: video request with audio quality.' };
   }
 
@@ -346,15 +447,15 @@ function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
   const isMp3Explicit =
     format === 'mp3' ||
     quality === 'mp3' ||
-    (type === 'audio' && quality && isSupportedMp3Bitrate(quality.toLowerCase())) ||
+    (type === 'audio' && quality && isSupportedMp3Bitrate(quality)) ||
     (type === 'audio' && Boolean(bitrate));
 
   if (isMp3Explicit) {
     let chosenBitrate: SupportedMp3Bitrate = '192k';
-    if (bitrate && isSupportedMp3Bitrate(bitrate.toLowerCase())) {
-      chosenBitrate = bitrate.toLowerCase() as SupportedMp3Bitrate;
-    } else if (quality && isSupportedMp3Bitrate(quality.toLowerCase())) {
-      chosenBitrate = quality.toLowerCase() as SupportedMp3Bitrate;
+    if (bitrate && isSupportedMp3Bitrate(bitrate)) {
+      chosenBitrate = bitrate as SupportedMp3Bitrate;
+    } else if (quality && isSupportedMp3Bitrate(quality)) {
+      chosenBitrate = quality as SupportedMp3Bitrate;
     }
 
     return {
@@ -367,7 +468,13 @@ function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
   }
 
   // Case 2: Native Audio Only
-  const isAudioExplicit = type === 'audio' || quality === 'audio' || format === 'audio' || format === 'm4a' || format === 'webm';
+  const isAudioExplicit =
+    type === 'audio' ||
+    quality === 'audio' ||
+    quality === 'audio only' ||
+    format === 'audio' ||
+    format === 'm4a' ||
+    format === 'webm';
   const isAudioLegacy =
     typeof format === 'string' &&
     (format === 'bestaudio[ext=m4a]/bestaudio' ||
@@ -410,7 +517,7 @@ function isSupportedMp3Bitrate(val: string): val is SupportedMp3Bitrate {
   let parsedHeight: number | null = null;
 
   if (quality) {
-    const cleanQ = quality.toLowerCase().replace(/p$/, '').trim();
+    const cleanQ = quality.replace(/p$/, '').trim();
     const num = parseInt(cleanQ, 10);
     if (!isNaN(num)) {
       parsedHeight = num;

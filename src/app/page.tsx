@@ -3,7 +3,16 @@
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 
-type MediaOption = { id: number; quality: string; format: string; size: string; type: string; url: string };
+type MediaOption = { id: string | number; quality: string; format: string; size: string; type: string; url: string; bitrate?: string; sizeBytes?: number };
+
+interface ExtractResponse {
+  title?: string;
+  thumbnail?: string | null;
+  options?: MediaOption[];
+  formats?: MediaOption[];
+  message?: string;
+  error?: string;
+}
 
 function Bubble({ size, top, left, delay, color }: { size: number; top: string; left: string; delay: string; color: string }) {
   return (
@@ -60,37 +69,120 @@ export default function Home() {
   const [mediaInfo, setMediaInfo] = useState<{ title: string; thumbnail: string | null } | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const extractAbortRef = useRef<AbortController | null>(null);
 
-  // Clean up polling timer on unmount without cancelling the backend job
+  // Clean up polling timer and in-flight extraction on unmount
   useEffect(() => {
     return () => {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
         pollIntervalRef.current = null;
       }
+      if (extractAbortRef.current) {
+        extractAbortRef.current.abort();
+        extractAbortRef.current = null;
+      }
     };
   }, []);
 
   const handleExtract = async () => {
-    if (!url.trim()) return;
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) return;
+
+    // Duplicate click protection: ignore repeated clicks while active
+    if (isLoading) return;
+
     setIsLoading(true);
     setMediaOptions(null);
     setMediaInfo(null);
     setError(null);
+
+    // Abort any prior in-flight extraction
+    if (extractAbortRef.current) {
+      extractAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    extractAbortRef.current = controller;
+
+    // Client-side extraction timeout (45 seconds)
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 45000);
+
+    let safeHost = "unknown";
+    try {
+      safeHost = new URL(trimmedUrl).hostname;
+    } catch {
+      safeHost = "invalid-url";
+    }
+
+    console.log("[client] Analyse request started for host:", safeHost);
+
     try {
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url: trimmedUrl }),
+        signal: controller.signal,
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.message || data.error || "Failed to extract media.");
-      setMediaInfo({ title: data.title, thumbnail: data.thumbnail });
+
+      console.log("[client] Analyse HTTP status:", res.status);
+      const contentType = res.headers.get("content-type") || "";
+      console.log("[client] Analyse response content-type:", contentType);
+
+      let data: ExtractResponse | null = null;
+      if (contentType.toLowerCase().includes("application/json")) {
+        try {
+          data = await res.json();
+        } catch {
+          throw new Error("Server returned an unparseable JSON response.");
+        }
+      } else {
+        const text = await res.text().catch(() => "");
+        if (!res.ok) {
+          throw new Error(`Server error (${res.status}): ${text.slice(0, 100) || "Unable to extract."}`);
+        }
+        throw new Error("Unexpected non-JSON response from server.");
+      }
+
+      console.log("[client] Analyse parsed response success:", Boolean(data && !data.error));
+
+      if (!res.ok) {
+        throw new Error(data?.message || data?.error || `Extraction failed with status ${res.status}.`);
+      }
+
+      if (!data || typeof data !== "object") {
+        throw new Error("Invalid response format received from server.");
+      }
+
+      const options: MediaOption[] = Array.isArray(data.options)
+        ? data.options
+        : Array.isArray(data.formats)
+        ? data.formats
+        : [];
+
+      if (options.length === 0) {
+        throw new Error("No downloadable formats were found for this URL.");
+      }
+
+      setMediaOptions(options);
+      setMediaInfo({
+        title: data.title || "Media",
+        thumbnail: data.thumbnail || null,
+      });
+      console.log("[client] State update reached with", options.length, "media options.");
     } catch (err: unknown) {
-      const e = err as { message?: string };
-      console.error("Extraction error:", err);
-      setError(e?.message || "Server is busy. Please try again.");
+      const e = err as { name?: string; message?: string };
+      if (e?.name === "AbortError") {
+        console.warn("[client] Extraction request timed out or was aborted.");
+        setError("Analysis timed out. Please verify your connection or try again.");
+      } else {
+        console.error("[client] Extraction error:", err);
+        setError(e?.message || "Server is busy. Please try again.");
+      }
     } finally {
+      clearTimeout(timeoutId);
+      extractAbortRef.current = null;
       setIsLoading(false);
     }
   };
@@ -120,13 +212,48 @@ export default function Home() {
 
     try {
       const parsed = new URL(opt.url, window.location.origin);
-      const payload = {
+
+      // Explicitly map selected option fields rather than inferring from unrelated fields
+      const selectedType = (opt.type || parsed.searchParams.get("type") || "video").toLowerCase();
+      const urlQuality = parsed.searchParams.get("quality");
+      const selectedQuality = selectedType === "audio"
+        ? (urlQuality || null)
+        : (urlQuality || (opt.quality === "Best Available" ? "best" : opt.quality) || "");
+      const selectedFormat = (opt.format ? opt.format.toLowerCase() : null) || parsed.searchParams.get("format") || (selectedType === "audio" ? "m4a" : "mp4");
+      const selectedSizeBytes = typeof opt.sizeBytes === "number"
+        ? opt.sizeBytes
+        : parsed.searchParams.get("sizeBytes")
+        ? Number(parsed.searchParams.get("sizeBytes"))
+        : undefined;
+
+      // Safe diagnostic logging (no cookies, credentials, raw URLs with query parameters, or secrets)
+      console.log("[client] Selected format download:", {
+        type: selectedType,
+        quality: selectedQuality,
+        format: selectedFormat,
+        sizeBytes: selectedSizeBytes,
+        estimatedSizeBytes: selectedSizeBytes,
+      });
+
+      const payload: Record<string, string | null> = {
         url: parsed.searchParams.get("url"),
-        type: parsed.searchParams.get("type"),
-        quality: parsed.searchParams.get("quality"),
-        format: parsed.searchParams.get("format"),
+        type: selectedType,
+        quality: selectedQuality,
+        format: selectedFormat,
         title: parsed.searchParams.get("title"),
       };
+      if (opt.id !== undefined && opt.id !== null) {
+        payload.formatId = String(opt.id);
+      } else if (parsed.searchParams.get("formatId")) {
+        payload.formatId = parsed.searchParams.get("formatId");
+      }
+      const resolvedBitrate = opt.bitrate || parsed.searchParams.get("bitrate");
+      if (resolvedBitrate) {
+        payload.bitrate = resolvedBitrate;
+      }
+      if (selectedSizeBytes !== undefined && !isNaN(selectedSizeBytes)) {
+        payload.sizeBytes = String(selectedSizeBytes);
+      }
 
       const res = await fetch("/api/download", {
         method: "POST",
@@ -178,7 +305,8 @@ export default function Home() {
               const downloadUrl = statusData.downloadUrl || `/api/download/${jobId}`;
               const a = document.createElement("a");
               a.href = downloadUrl;
-              a.download = statusData.fileName || `${(mediaInfo?.title || "download").replace(/[^a-z0-9]/gi, "_")}.${opt.type === "audio" ? "m4a" : "mp4"}`;
+              const fallbackExt = opt.type === "audio" ? (opt.format?.toLowerCase() === "mp3" ? "mp3" : "m4a") : "mp4";
+              a.download = statusData.fileName || `${(mediaInfo?.title || "download").replace(/[^a-z0-9]/gi, "_")}.${fallbackExt}`;
               document.body.appendChild(a);
               a.click();
               document.body.removeChild(a);
@@ -398,7 +526,7 @@ export default function Home() {
               <button
                 suppressHydrationWarning
                 onClick={handleExtract}
-                disabled={isLoading}
+                disabled={isLoading || !url.trim()}
                 className="glow-effect rounded-xl bg-white text-black font-semibold px-6 py-3 sm:py-0 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed min-w-[140px]"
               >
                 {isLoading ? (

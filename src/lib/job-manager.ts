@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { ChildProcess } from 'child_process';
+import { ChildProcess, execFile } from 'child_process';
 import ffmpeg from 'fluent-ffmpeg';
 
 // Resolve physical absolute path to ffmpeg-static binary to avoid Next.js virtual ROOT path
@@ -20,7 +20,18 @@ if (fs.existsSync(localFfmpeg)) {
 }
 
 import { acquireDownloadSlot, releaseDownloadSlot, checkDiskSpace } from './concurrency';
-import { runCommandWithLifecycle, killProcessTree, TIMEOUT_CONFIG } from './process-manager';
+import {
+  runCommandWithLifecycle,
+  killProcessTree,
+  TIMEOUT_CONFIG,
+  calculateDownloadTimeout,
+  getDownloadTimeoutDetails,
+  getDownloadStallTimeoutMs,
+  getConcurrentFragments,
+  getDownloadBufferSize,
+  parseYtDlpProgress,
+  DEFAULT_CONCURRENT_FRAGMENTS,
+} from './process-manager';
 import { safeCleanupDirectory, getCookiesPath, cleanupCookiesFile } from './utils';
 import { ValidatedFormat, sanitizeMetadata } from './validation';
 import { logOperationalEvent, sanitizeUrlForLogging } from './logger';
@@ -41,6 +52,7 @@ export interface JobMetrics {
   totalDurationMs?: number;
   fileSizeBytes?: number;
   outputThroughputBps?: number;
+  lastSpeedBps?: number;
   retryCount: number;
 }
 
@@ -60,6 +72,10 @@ export interface DownloadJob {
   contentType: string;
   actualHeight?: number;
   actualContainer?: string;
+
+  // Size-aware timeout tracking
+  estimatedSizeBytes?: number;
+  downloadTimeoutMs?: number;
 
   // Optional media metadata for ID3 tagging
   metadata?: {
@@ -261,6 +277,52 @@ export function validateMediaFileIntegrity(
   }
 }
 
+export interface MediaStreamsInfo {
+  hasVideo: boolean;
+  hasAudio: boolean;
+  videoCodec?: string;
+  audioCodec?: string;
+  raw?: string;
+}
+
+/**
+ * Inspects media streams using FFmpeg banner output without buffering the entire media file into memory.
+ * Accurately detects presence of video stream and audio stream, along with their respective codecs.
+ */
+export function inspectMediaStreams(filePath: string): Promise<MediaStreamsInfo> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(filePath)) {
+      return resolve({ hasVideo: false, hasAudio: false });
+    }
+    execFile(
+      resolvedFfmpegPath,
+      ['-hide_banner', '-i', filePath],
+      { timeout: 15000 },
+      (err, stdout, stderr) => {
+        const output = (stdout || '') + (stderr || '');
+        let hasVideo = false;
+        let hasAudio = false;
+        let videoCodec: string | undefined;
+        let audioCodec: string | undefined;
+
+        const videoMatch = output.match(/Stream #\d+:\d+.*?: Video: ([a-zA-Z0-9_-]+)/i);
+        if (videoMatch) {
+          hasVideo = true;
+          videoCodec = videoMatch[1].toLowerCase();
+        }
+
+        const audioMatch = output.match(/Stream #\d+:\d+.*?: Audio: ([a-zA-Z0-9_-]+)/i);
+        if (audioMatch) {
+          hasAudio = true;
+          audioCodec = audioMatch[1].toLowerCase();
+        }
+
+        resolve({ hasVideo, hasAudio, videoCodec, audioCodec, raw: output });
+      }
+    );
+  });
+}
+
 /**
  * Classifies whether a failure is a transient network/connection error suitable for 1 bounded retry.
  * Explicitly rejects client cancellations, format errors, bot checks, and 403 Forbidden.
@@ -414,20 +476,41 @@ async function runYtDlpWithRetry(
   baseProgress: number,
   progressScale: number
 ): Promise<{ stdout: string; stderr: string }> {
+  let lastSpeedSampleTime = 0;
+  const SPEED_SAMPLE_INTERVAL_MS = 5000;
+
   const onProgressLine = (line: string) => {
-    const match = line.match(/\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);
-    if (match) {
-      const pct = parseFloat(match[1]);
-      if (!isNaN(pct)) {
-        const computed = Math.round(baseProgress + (pct / 100) * progressScale);
-        job.progress = Math.min(100, Math.max(0, computed));
+    const parsed = parseYtDlpProgress(line, job.estimatedSizeBytes);
+    if (parsed?.percent !== undefined && !isNaN(parsed.percent)) {
+      const computed = Math.round(baseProgress + (parsed.percent / 100) * progressScale);
+      job.progress = Math.min(100, Math.max(0, computed));
+    }
+
+    if (parsed?.bytesPerSecond !== undefined && parsed.bytesPerSecond > 0) {
+      job.metrics.lastSpeedBps = parsed.bytesPerSecond;
+      const now = Date.now();
+      if (now - lastSpeedSampleTime >= SPEED_SAMPLE_INTERVAL_MS) {
+        lastSpeedSampleTime = now;
+        logOperationalEvent({
+          event: 'download_speed_sample',
+          jobId: job.id,
+          bytesPerSecond: parsed.bytesPerSecond,
+          megabytesPerSecond:
+            parsed.megabytesPerSecond ?? Math.round((parsed.bytesPerSecond / (1024 * 1024)) * 100) / 100,
+          progressPercent: parsed.percent,
+          downloadedBytes: parsed.downloadedBytes,
+        });
       }
     }
   };
 
+  const timeoutMs = job.downloadTimeoutMs || calculateDownloadTimeout(job.estimatedSizeBytes);
+  const stallTimeoutMs = getDownloadStallTimeoutMs();
+
   try {
     return await runCommandWithLifecycle(cmd, args, {
-      timeoutMs: TIMEOUT_CONFIG.MAX_DOWNLOAD_TIME,
+      timeoutMs,
+      stallTimeoutMs,
       clientSignal: job.abortController.signal,
       onStdoutLine: onProgressLine,
       onStderrLine: onProgressLine,
@@ -450,6 +533,16 @@ async function runYtDlpWithRetry(
         retryCount: job.metrics.retryCount,
       });
 
+      // Adaptive concurrency: on transient network failure, reduce concurrency back toward 8
+      const retryArgs = [...args];
+      const fragIdx = retryArgs.indexOf('--concurrent-fragments');
+      if (fragIdx !== -1 && fragIdx + 1 < retryArgs.length) {
+        const currentVal = parseInt(retryArgs[fragIdx + 1], 10);
+        if (currentVal > DEFAULT_CONCURRENT_FRAGMENTS) {
+          retryArgs[fragIdx + 1] = String(DEFAULT_CONCURRENT_FRAGMENTS);
+        }
+      }
+
       // Clean up partial downloads in tmpDir before retrying
       try {
         const partialFiles = fs
@@ -468,8 +561,9 @@ async function runYtDlpWithRetry(
         throw err;
       }
 
-      return await runCommandWithLifecycle(cmd, args, {
-        timeoutMs: TIMEOUT_CONFIG.MAX_DOWNLOAD_TIME,
+      return await runCommandWithLifecycle(cmd, retryArgs, {
+        timeoutMs,
+        stallTimeoutMs,
         clientSignal: job.abortController.signal,
         onStdoutLine: onProgressLine,
         onStderrLine: onProgressLine,
@@ -501,6 +595,18 @@ export async function executeJobWorker(
     transitionStatus(job, 'downloading');
     job.stage = 'Initializing download streams...';
 
+    // Calculate production-safe size-aware timeout and emit structured event
+    const timeoutDetails = getDownloadTimeoutDetails(job.estimatedSizeBytes);
+    job.downloadTimeoutMs = timeoutDetails.timeoutMs;
+
+    logOperationalEvent({
+      event: 'download_timeout_calculated',
+      jobId: job.id,
+      estimatedSizeBytes: timeoutDetails.sizeBytes,
+      calculatedTimeoutMs: timeoutDetails.timeoutMs,
+      sizeSource: timeoutDetails.sizeSource,
+    });
+
     logOperationalEvent({
       event: 'download_started',
       jobId: job.id,
@@ -512,13 +618,17 @@ export async function executeJobWorker(
 
     const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
 
+    const concurrentFragments = getConcurrentFragments();
+    const bufferSize = getDownloadBufferSize();
+
     const commonCliArgs = [
       '--no-warnings',
       '--extractor-args', extractorArgs,
       '--retries', '10',
       '--fragment-retries', '10',
       '--file-access-retries', '5',
-      '--buffer-size', '1024K',
+      '--concurrent-fragments', String(concurrentFragments),
+      '--buffer-size', bufferSize,
       '--socket-timeout', '30',
       '--newline',
     ];
@@ -824,6 +934,37 @@ export async function executeJobWorker(
 
       if ((job.status as JobStatus) === 'cancelled' || job.abortController.signal.aborted) return;
 
+      // 1. Inspect temporary directory after video download completes
+      const postVideoFiles = fs
+        .readdirSync(job.tmpDir)
+        .filter((f) => !f.endsWith('.part') && !f.endsWith('.ytdl'));
+
+      let actualVideoFile: string | null = null;
+      let videoStreamInfo: MediaStreamsInfo | null = null;
+
+      // Candidate ordering: prioritize files starting with 'video'
+      const videoCandidates = postVideoFiles
+        .filter((f) => f.startsWith('video'))
+        .concat(postVideoFiles.filter((f) => !f.startsWith('video')));
+
+      for (const file of videoCandidates) {
+        const fullPath = path.join(job.tmpDir, file);
+        const info = await inspectMediaStreams(fullPath);
+        if (info.hasVideo) {
+          actualVideoFile = fullPath;
+          videoStreamInfo = info;
+          break;
+        }
+      }
+
+      if (!actualVideoFile || !videoStreamInfo?.hasVideo) {
+        throw new Error('Video stream download failed: no valid video stream found on disk.');
+      }
+
+      console.log(
+        `[job-manager] Job ${job.id} verified video file: ${path.basename(actualVideoFile)} (codec: ${videoStreamInfo.videoCodec || 'unknown'})`
+      );
+
       job.stage = 'Downloading audio stream...';
       job.progress = 55;
 
@@ -841,20 +982,63 @@ export async function executeJobWorker(
       const downloadEnd = Date.now();
       job.metrics.downloadDurationMs = downloadEnd - job.metrics.startTime;
 
-      // Locate downloaded streams
-      const videoFiles = fs.readdirSync(job.tmpDir).filter((f) => f.startsWith('video') && !f.endsWith('.part') && !f.endsWith('.ytdl'));
-      const audioFiles = fs.readdirSync(job.tmpDir).filter((f) => f.startsWith('audio') && !f.endsWith('.part') && !f.endsWith('.ytdl'));
+      // 2. Inspect temporary directory after audio download completes
+      const postAudioFiles = fs
+        .readdirSync(job.tmpDir)
+        .filter(
+          (f) => !f.endsWith('.part') && !f.endsWith('.ytdl') && path.join(job.tmpDir, f) !== actualVideoFile
+        );
 
-      if (videoFiles.length === 0) throw new Error('Video stream download failed.');
-      if (audioFiles.length === 0) throw new Error('Audio stream download failed.');
+      let actualAudioFile: string | null = null;
+      let audioStreamInfo: MediaStreamsInfo | null = null;
 
-      const actualVideoFile = path.join(job.tmpDir, videoFiles[0]);
-      const actualAudioFile = path.join(job.tmpDir, audioFiles[0]);
+      // Prioritize files starting with 'audio'
+      const audioCandidates = postAudioFiles
+        .filter((f) => f.startsWith('audio'))
+        .concat(postAudioFiles.filter((f) => !f.startsWith('audio')));
+
+      for (const file of audioCandidates) {
+        const fullPath = path.join(job.tmpDir, file);
+        const info = await inspectMediaStreams(fullPath);
+        if (info.hasAudio && !info.hasVideo) {
+          actualAudioFile = fullPath;
+          audioStreamInfo = info;
+          break;
+        }
+      }
+
+      // Fallback: if no dedicated audio-only file was found, check if actualVideoFile already contains audio
+      if (!actualAudioFile) {
+        if (videoStreamInfo.hasAudio) {
+          actualAudioFile = actualVideoFile;
+          audioStreamInfo = videoStreamInfo;
+        } else {
+          for (const file of audioCandidates) {
+            const fullPath = path.join(job.tmpDir, file);
+            const info = await inspectMediaStreams(fullPath);
+            if (info.hasAudio) {
+              actualAudioFile = fullPath;
+              audioStreamInfo = info;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!actualAudioFile || !audioStreamInfo?.hasAudio) {
+        throw new Error('Audio stream download failed: no valid audio stream found on disk.');
+      }
+
+      console.log(
+        `[job-manager] Job ${job.id} verified audio file: ${path.basename(actualAudioFile)} (codec: ${audioStreamInfo.audioCodec || 'unknown'})`
+      );
 
       // Container compatibility detection
-      const isVideoWebm = videoFiles[0].endsWith('.webm');
-      const isAudioWebm = audioFiles[0].endsWith('.webm') || audioFiles[0].endsWith('.opus');
-      const isWebm = isVideoWebm && isAudioWebm;
+      // Rule: For MP4 requests (default), final output MUST be .mp4 with video/mp4.
+      const isVideoWebm = path.extname(actualVideoFile).toLowerCase() === '.webm';
+      const isAudioWebm = path.extname(actualAudioFile).toLowerCase() === '.webm' || audioStreamInfo.audioCodec === 'opus';
+      const requestedWebm = formatValidation.videoSelector?.includes('ext=webm');
+      const isWebm = requestedWebm || (isVideoWebm && isAudioWebm && !formatValidation.videoSelector?.includes('ext=mp4'));
 
       const containerExt = isWebm ? 'webm' : 'mp4';
       const outputMime = isWebm ? 'video/webm' : 'video/mp4';
@@ -908,10 +1092,41 @@ export async function executeJobWorker(
           }, TIMEOUT_CONFIG.MAX_CONVERSION_TIME);
         }
 
-        const command = ffmpeg()
-          .input(actualVideoFile)
-          .input(actualAudioFile)
-          .outputOptions(['-c:v copy', '-c:a copy'])
+        const command = ffmpeg();
+        command.input(actualVideoFile!);
+
+        const isAudioAac = audioStreamInfo?.audioCodec === 'aac';
+        const outputOptions: string[] = [];
+
+        if (actualVideoFile === actualAudioFile) {
+          outputOptions.push('-c:v copy');
+          if (containerExt === 'mp4') {
+            if (isAudioAac) {
+              outputOptions.push('-c:a copy');
+            } else {
+              outputOptions.push('-c:a aac', '-b:a 192k');
+            }
+            outputOptions.push('-movflags +faststart');
+          } else {
+            outputOptions.push('-c:a copy');
+          }
+        } else {
+          command.input(actualAudioFile!);
+          outputOptions.push('-map 0:v:0', '-map 1:a:0', '-c:v copy');
+          if (containerExt === 'mp4') {
+            if (isAudioAac) {
+              outputOptions.push('-c:a copy');
+            } else {
+              outputOptions.push('-c:a aac', '-b:a 192k');
+            }
+            outputOptions.push('-movflags +faststart');
+          } else {
+            outputOptions.push('-c:a copy');
+          }
+        }
+
+        command
+          .outputOptions(outputOptions)
           .output(workingMergedFile)
           .on('start', () => {
             ffmpegProc = (command as unknown as { ffmpegProc?: ChildProcess }).ffmpegProc || null;
@@ -932,10 +1147,6 @@ export async function executeJobWorker(
             reject(err);
           });
 
-        if (!isWebm) {
-          command.outputOptions(['-movflags +faststart']);
-        }
-
         command.run();
       });
 
@@ -943,14 +1154,26 @@ export async function executeJobWorker(
 
       job.metrics.processingDurationMs = Date.now() - ffmpegStart;
 
+      // Stream verification on working merged file before finalizing
+      const finalStreamCheck = await inspectMediaStreams(workingMergedFile);
+      if (!finalStreamCheck.hasVideo || !finalStreamCheck.hasAudio) {
+        try { fs.unlinkSync(workingMergedFile); } catch {}
+        throw new Error(
+          `Merged media file validation failed: missing required streams (hasVideo: ${finalStreamCheck.hasVideo}, hasAudio: ${finalStreamCheck.hasAudio}).`
+        );
+      }
+
       // Atomic rename of finalized output
       fs.renameSync(workingMergedFile, finalFilePath);
 
       // Clean up intermediate raw stream files immediately to minimize disk usage
-      try {
-        fs.unlinkSync(actualVideoFile);
-        fs.unlinkSync(actualAudioFile);
-      } catch {}
+      const allFiles = fs.readdirSync(job.tmpDir);
+      for (const f of allFiles) {
+        const full = path.join(job.tmpDir, f);
+        if (full !== finalFilePath && !f.endsWith('.part') && !f.endsWith('.ytdl')) {
+          try { fs.unlinkSync(full); } catch {}
+        }
+      }
 
       const stat = fs.statSync(finalFilePath);
       if (stat.size === 0) {
@@ -1011,6 +1234,11 @@ export async function executeJobWorker(
         code: 'DOWNLOAD_TIMEOUT',
         message: 'Download or conversion exceeded maximum execution time.',
       };
+    } else if (err?.code === 'ESTALL') {
+      job.error = {
+        code: 'DOWNLOAD_STALLED',
+        message: 'Download stalled: no progress received for configured stall duration.',
+      };
     } else if (err?.code === 'ECONNABORTED') {
       job.error = {
         code: 'CANCELLED',
@@ -1065,6 +1293,7 @@ export function createJob(params: {
   safeTitle: string;
   ytDlpPath: string;
   isProduction: boolean;
+  estimatedSizeBytes?: number;
   metadata?: {
     title?: string;
     artist?: string;
@@ -1127,6 +1356,12 @@ export function createJob(params: {
       : params.formatValidation.isAudioOnly
       ? 'audio/mp4'
       : 'video/mp4',
+    estimatedSizeBytes:
+      typeof params.estimatedSizeBytes === 'number' &&
+      Number.isFinite(params.estimatedSizeBytes) &&
+      params.estimatedSizeBytes > 0
+        ? Math.round(params.estimatedSizeBytes)
+        : undefined,
     metadata: params.metadata,
     activeStreams: 0,
     cleanupPending: false,

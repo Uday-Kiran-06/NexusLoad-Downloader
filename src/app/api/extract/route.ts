@@ -5,9 +5,10 @@ import os from 'os';
 import fs from 'fs';
 
 import { getCookiesPath, cleanupCookiesFile } from '@/lib/utils';
-import { validateUrl, sanitizeFilename, parseBoundedJson } from '@/lib/validation';
+import { validateUrlForDownload, sanitizeFilename, parseBoundedJson } from '@/lib/validation';
 import { createApiError } from '@/lib/errors';
 import { runCommandWithLifecycle, TIMEOUT_CONFIG } from '@/lib/process-manager';
+import { logOperationalEvent, sanitizeUrlForLogging } from '@/lib/logger';
 
 // Binary path resolution
 const isWin = os.platform() === 'win32';
@@ -20,6 +21,13 @@ const localYtDlp = path.join(
 );
 const ytDlpPath = fs.existsSync(localYtDlp) ? localYtDlp : 'yt-dlp';
 const isProduction = process.env.NODE_ENV === 'production';
+
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'X-Frame-Options': 'SAMEORIGIN',
+};
 
 interface YtDlpFormat {
   vcodec?: string;
@@ -56,11 +64,21 @@ export async function POST(req: Request) {
 
     const { url } = body;
 
-    // 1. Server-side URL Validation
-    const urlValidation = validateUrl(url);
+    console.log('[extract] Request received for host:', sanitizeUrlForLogging(typeof url === 'string' ? url : undefined));
+
+    // 1. Server-side URL Validation with SSRF & Private CIDR checks
+    const urlValidation = await validateUrlForDownload(url);
     if (!urlValidation.valid || !urlValidation.normalizedUrl) {
+      console.warn('[extract] URL validation failed:', urlValidation.error);
+      logOperationalEvent({
+        event: 'ssrf_rejected',
+        reason: urlValidation.error || 'Invalid URL provided.',
+        status: 400,
+      });
       return createApiError('INVALID_URL', urlValidation.error || 'Invalid URL provided.', 400);
     }
+
+    console.log('[extract] URL validation passed.');
 
     const validUrl = urlValidation.normalizedUrl;
     let info: YtDlpInfo | undefined;
@@ -99,7 +117,7 @@ export async function POST(req: Request) {
     }
     cliArgs.push(validUrl);
 
-    console.log('[extract] Starting media extraction job...');
+    console.log('[extract] Extractor started via yt-dlp.');
 
     try {
       const { stdout } = await runCommandWithLifecycle(ytDlpPath, cliArgs, {
@@ -109,12 +127,15 @@ export async function POST(req: Request) {
       });
 
       info = JSON.parse(stdout);
+      console.log('[extract] Extractor completed successfully.');
     } catch (primaryErr: unknown) {
       const pErr = primaryErr as { code?: string };
       if (req.signal.aborted || pErr?.code === 'ECONNABORTED') {
+        console.warn('[extract] Extraction aborted by client.');
         return createApiError('CANCELLED', 'Extraction aborted by client.', 499);
       }
       if (pErr?.code === 'ETIMEDOUT') {
+        console.warn('[extract] Extraction timed out.');
         return createApiError('DOWNLOAD_TIMEOUT', 'Media extraction timed out.', 504);
       }
 
@@ -130,7 +151,6 @@ export async function POST(req: Request) {
         const encodedUrl = encodeURIComponent(validUrl);
         const encodedTitle = encodeURIComponent(title);
         const options = [];
-        let idCounter = 1;
 
         const videoHeights = new Set<number>();
         (ytdlInfo.formats || []).forEach((f) => {
@@ -142,56 +162,64 @@ export async function POST(req: Request) {
         const sortedHeights = Array.from(videoHeights).sort((a, b) => b - a);
 
         for (const height of sortedHeights) {
-          const formatStr = encodeURIComponent(
-            `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`
-          );
           options.push({
-            id: idCounter++,
+            id: `video_${height}p`,
             quality: `${height}p`,
             format: 'MP4',
             size: '—',
             type: 'video',
-            url: `/api/download?url=${encodedUrl}&type=video&quality=${height}p&format=${formatStr}&title=${encodedTitle}`,
+            url: `/api/download?url=${encodedUrl}&type=video&quality=${height}p&format=mp4&formatId=video_${height}p&title=${encodedTitle}`,
           });
         }
 
         if (options.length === 0) {
-          const formatStr = encodeURIComponent('bestvideo+bestaudio/best');
           options.push({
-            id: idCounter++,
+            id: 'video_best',
             quality: 'Best Available',
             format: 'MP4',
             size: '—',
             type: 'video',
-            url: `/api/download?url=${encodedUrl}&type=video&quality=best&format=${formatStr}&title=${encodedTitle}`,
+            url: `/api/download?url=${encodedUrl}&type=video&quality=best&format=mp4&formatId=video_best&title=${encodedTitle}`,
           });
         }
 
-        const audioFormatStr = encodeURIComponent('bestaudio[ext=m4a]/bestaudio');
         options.push({
-          id: idCounter++,
+          id: 'audio_m4a',
           quality: 'Audio Only',
           format: 'M4A',
           size: '—',
           type: 'audio',
-          url: `/api/download?url=${encodedUrl}&type=audio&format=${audioFormatStr}&title=${encodedTitle}`,
+          url: `/api/download?url=${encodedUrl}&type=audio&format=m4a&formatId=audio_m4a&title=${encodedTitle}`,
         });
         options.push({
-          id: idCounter++,
+          id: 'audio_mp3_192k',
           quality: 'MP3 (192 kbps)',
           format: 'MP3',
+          bitrate: '192k',
           size: '—',
           type: 'audio',
-          url: `/api/download?url=${encodedUrl}&type=audio&format=mp3&bitrate=192k&title=${encodedTitle}`,
+          url: `/api/download?url=${encodedUrl}&type=audio&format=mp3&bitrate=192k&formatId=audio_mp3_192k&title=${encodedTitle}`,
         });
 
-        console.log('[extract] Fallback extraction succeeded.');
-        return NextResponse.json({
-          title,
-          thumbnail,
-          options,
-        });
+        if (options.length === 0) {
+          console.warn('[extract] Fallback extraction produced 0 options.');
+          return createApiError('EXTRACTION_FAILED', 'No downloadable formats were found for this URL.', 404);
+        }
+
+        console.log('[extract] Fallback extraction succeeded with', options.length, 'options.');
+        console.log('[extract] Response returned with status 200.');
+        return NextResponse.json(
+          {
+            title,
+            thumbnail,
+            options,
+          },
+          {
+            headers: SECURITY_HEADERS,
+          }
+        );
       } catch {
+        console.warn('[extract] Fallback extraction failed.');
         // Both primary and fallback failed; sanitize client error message
         return createApiError('EXTRACTION_FAILED', 'Failed to extract media information from URL.', 500);
       }
@@ -205,7 +233,6 @@ export async function POST(req: Request) {
     const encodedUrl = encodeURIComponent(validUrl);
     const encodedTitle = encodeURIComponent(safeTitle);
     const options = [];
-    let idCounter = 1;
 
     // Parse video formats and deduplicate by height
     const formats: YtDlpFormat[] = info?.formats || [];
@@ -232,56 +259,71 @@ export async function POST(req: Request) {
       const videoSizeBytes = videoSample?.filesize || videoSample?.filesize_approx || 0;
       const totalBytes = videoSizeBytes + audioSizeBytes;
       const sizeMB = totalBytes > 0 ? `~${(totalBytes / (1024 * 1024)).toFixed(0)} MB` : '—';
-
-      const formatStr = encodeURIComponent(`bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`);
+      const sizeParam = totalBytes > 0 ? `&sizeBytes=${totalBytes}` : '';
 
       options.push({
-        id: idCounter++,
+        id: `video_${height}p`,
         quality: `${height}p`,
         format: 'MP4',
         size: sizeMB,
+        sizeBytes: totalBytes > 0 ? totalBytes : undefined,
         type: 'video',
-        url: `/api/download?url=${encodedUrl}&type=video&quality=${height}p&format=${formatStr}&title=${encodedTitle}`,
+        url: `/api/download?url=${encodedUrl}&type=video&quality=${height}p&format=mp4&formatId=video_${height}p&title=${encodedTitle}${sizeParam}`,
       });
     }
 
     if (options.length === 0) {
-      const formatStr = encodeURIComponent('bestvideo+bestaudio/best');
       options.push({
-        id: idCounter++,
+        id: 'video_best',
         quality: 'Best Available',
         format: 'MP4',
         size: '—',
         type: 'video',
-        url: `/api/download?url=${encodedUrl}&type=video&quality=best&format=${formatStr}&title=${encodedTitle}`,
+        url: `/api/download?url=${encodedUrl}&type=video&quality=best&format=mp4&formatId=video_best&title=${encodedTitle}`,
       });
     }
 
-    const audioFormatStr = encodeURIComponent('bestaudio[ext=m4a]/bestaudio');
+    const audioSizeParam = audioSizeBytes > 0 ? `&sizeBytes=${audioSizeBytes}` : '';
+
     options.push({
-      id: idCounter++,
+      id: 'audio_m4a',
       quality: 'Audio Only',
       format: 'M4A',
       size: audioSizeBytes > 0 ? `~${(audioSizeBytes / (1024 * 1024)).toFixed(0)} MB` : '—',
+      sizeBytes: audioSizeBytes > 0 ? audioSizeBytes : undefined,
       type: 'audio',
-      url: `/api/download?url=${encodedUrl}&type=audio&format=${audioFormatStr}&title=${encodedTitle}`,
+      url: `/api/download?url=${encodedUrl}&type=audio&format=m4a&formatId=audio_m4a&title=${encodedTitle}${audioSizeParam}`,
     });
     options.push({
-      id: idCounter++,
+      id: 'audio_mp3_192k',
       quality: 'MP3 (192 kbps)',
       format: 'MP3',
+      bitrate: '192k',
       size: audioSizeBytes > 0 ? `~${(audioSizeBytes / (1024 * 1024)).toFixed(0)} MB` : '—',
+      sizeBytes: audioSizeBytes > 0 ? audioSizeBytes : undefined,
       type: 'audio',
-      url: `/api/download?url=${encodedUrl}&type=audio&format=mp3&bitrate=192k&title=${encodedTitle}`,
+      url: `/api/download?url=${encodedUrl}&type=audio&format=mp3&bitrate=192k&formatId=audio_mp3_192k&title=${encodedTitle}${audioSizeParam}`,
     });
 
-    console.log('[extract] Media metadata extracted successfully.');
-    return NextResponse.json({
-      title: safeTitle,
-      thumbnail: info.thumbnail || null,
-      options,
-    });
-  } catch {
+    if (options.length === 0) {
+      console.warn('[extract] Extractor produced 0 options.');
+      return createApiError('EXTRACTION_FAILED', 'No downloadable formats were found for this URL.', 404);
+    }
+
+    console.log('[extract] Extractor completed successfully with', options.length, 'options.');
+    console.log('[extract] Response returned with status 200.');
+    return NextResponse.json(
+      {
+        title: safeTitle,
+        thumbnail: info.thumbnail || null,
+        options,
+      },
+      {
+        headers: SECURITY_HEADERS,
+      }
+    );
+  } catch (err: unknown) {
+    console.error('[extract] Unexpected internal error during extraction:', err instanceof Error ? err.message : 'Unknown');
     return createApiError('INTERNAL_ERROR', 'An unexpected error occurred during extraction.', 500);
   } finally {
     cleanupCookiesFile(cookiesPath);

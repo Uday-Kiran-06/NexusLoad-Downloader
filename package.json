@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "npx tsx tests/phase4_1.test.mjs && npx tsx tests/phase5.test.mjs && npx tsx tests/phase6.test.mjs"
+    "postinstall": "node scripts/ensure-ytdlp.mjs",
+    "test": "npx tsx tests/phase4_1.test.mjs && npx tsx tests/phase5.test.mjs && npx tsx tests/phase6.test.mjs && npx tsx tests/contract-fix.test.mjs && npx tsx tests/phase6_1.test.mjs && npx tsx tests/video-stream-regression.test.mjs && npx tsx tests/phase6_2.test.mjs"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

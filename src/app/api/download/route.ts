@@ -30,11 +30,14 @@ const ALLOWED_DOWNLOAD_KEYS = new Set([
   'type',
   'quality',
   'format',
+  'formatId',
   'title',
   'bitrate',
   'artist',
   'album',
   'date',
+  'sizeBytes',
+  'estimatedSizeBytes',
 ]);
 
 async function handleDownloadJobCreation(
@@ -44,11 +47,13 @@ async function handleDownloadJobCreation(
     rawType: unknown;
     rawQuality: unknown;
     rawFormat: unknown;
+    rawFormatId?: unknown;
     rawTitle: unknown;
     rawBitrate?: unknown;
     rawArtist?: unknown;
     rawAlbum?: unknown;
     rawDate?: unknown;
+    rawSizeBytes?: unknown;
   }
 ): Promise<NextResponse> {
   // 1. Rate Limiting Check
@@ -71,7 +76,7 @@ async function handleDownloadJobCreation(
   }
 
   // 2. Strict Input Type & Value Validation
-  const { rawUrl, rawType, rawQuality, rawFormat, rawTitle, rawBitrate, rawArtist, rawAlbum, rawDate } = params;
+  const { rawUrl, rawType, rawQuality, rawFormat, rawFormatId, rawTitle, rawBitrate, rawArtist, rawAlbum, rawDate } = params;
 
   if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
     return createApiError('INVALID_REQUEST', 'Missing or invalid required parameter: url.', 400);
@@ -83,6 +88,15 @@ async function handleDownloadJobCreation(
   if (rawType !== undefined && rawType !== null) {
     if (typeof rawType !== 'string' || (rawType !== 'audio' && rawType !== 'video')) {
       return createApiError('INVALID_REQUEST', "Invalid 'type' value. Allowed: 'audio' or 'video'.", 400);
+    }
+  }
+
+  if (rawFormatId !== undefined && rawFormatId !== null) {
+    if (typeof rawFormatId !== 'string') {
+      return createApiError('INVALID_REQUEST', "Parameter 'formatId' must be a string.", 400);
+    }
+    if (rawFormatId.length > 64) {
+      return createApiError('INVALID_REQUEST', "Parameter 'formatId' exceeds maximum length of 64 characters.", 400);
     }
   }
 
@@ -128,10 +142,20 @@ async function handleDownloadJobCreation(
   const validUrl = urlValidation.normalizedUrl;
 
   // 4. Format & Quality Validation
+  logOperationalEvent({
+    event: 'download_format_requested',
+    type: typeof rawType === 'string' ? rawType : undefined,
+    quality: typeof rawQuality === 'string' ? rawQuality : undefined,
+    format: typeof rawFormat === 'string' ? rawFormat : undefined,
+    formatId: typeof rawFormatId === 'string' ? rawFormatId : undefined,
+    sizeBytes: params.rawSizeBytes ? Number(params.rawSizeBytes) : undefined,
+  });
+
   const formatValidation = validateAndMapFormat({
     type: typeof rawType === 'string' ? rawType : null,
     quality: typeof rawQuality === 'string' ? rawQuality : null,
     format: typeof rawFormat === 'string' ? rawFormat : null,
+    formatId: typeof rawFormatId === 'string' ? rawFormatId : null,
     bitrate: typeof rawBitrate === 'string' ? rawBitrate : null,
   });
   if (!formatValidation.valid) {
@@ -154,6 +178,15 @@ async function handleDownloadJobCreation(
     );
   }
 
+  // Parse and validate estimated size if provided
+  let estimatedSizeBytes: number | undefined;
+  if (params.rawSizeBytes !== undefined && params.rawSizeBytes !== null) {
+    const parsedSize = Number(params.rawSizeBytes);
+    if (Number.isFinite(parsedSize) && parsedSize > 0 && parsedSize <= 100 * 1024 * 1024 * 1024) {
+      estimatedSizeBytes = Math.round(parsedSize);
+    }
+  }
+
   // 7. Job Creation & Concurrency Slot Acquisition
   const { job, error } = createJob({
     validUrl,
@@ -161,6 +194,7 @@ async function handleDownloadJobCreation(
     safeTitle,
     ytDlpPath,
     isProduction,
+    estimatedSizeBytes,
     metadata: {
       title: safeTitle,
       artist: safeArtist,
@@ -222,11 +256,17 @@ export async function POST(req: Request) {
     rawType: body?.type || searchParams.get('type'),
     rawQuality: body?.quality || searchParams.get('quality'),
     rawFormat: body?.format || searchParams.get('format'),
+    rawFormatId: body?.formatId || searchParams.get('formatId'),
     rawTitle: body?.title || searchParams.get('title'),
     rawBitrate: body?.bitrate || searchParams.get('bitrate'),
     rawArtist: body?.artist || searchParams.get('artist'),
     rawAlbum: body?.album || searchParams.get('album'),
     rawDate: body?.date || searchParams.get('date'),
+    rawSizeBytes:
+      body?.sizeBytes ??
+      body?.estimatedSizeBytes ??
+      searchParams.get('sizeBytes') ??
+      searchParams.get('estimatedSizeBytes'),
   });
 }
 
@@ -249,10 +289,12 @@ export async function GET(req: Request) {
     rawType: searchParams.get('type'),
     rawQuality: searchParams.get('quality'),
     rawFormat: searchParams.get('format'),
+    rawFormatId: searchParams.get('formatId'),
     rawTitle: searchParams.get('title'),
     rawBitrate: searchParams.get('bitrate'),
     rawArtist: searchParams.get('artist'),
     rawAlbum: searchParams.get('album'),
     rawDate: searchParams.get('date'),
+    rawSizeBytes: searchParams.get('sizeBytes') ?? searchParams.get('estimatedSizeBytes'),
   });
 }

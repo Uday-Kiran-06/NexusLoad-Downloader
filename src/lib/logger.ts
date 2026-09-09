@@ -10,6 +10,9 @@ export type OperationalEventType =
   | 'download_started'
   | 'download_retry'
   | 'download_completed'
+  | 'download_timeout_calculated'
+  | 'download_format_requested'
+  | 'download_speed_sample'
   | 'mp3_transcode_started'
   | 'mp3_transcode_completed'
   | 'job_cancelled'
@@ -24,7 +27,10 @@ export interface OperationalLogPayload {
   jobId?: string;
   clientIp?: string;
   urlHost?: string;
+  type?: string;
+  quality?: string;
   format?: string;
+  formatId?: string;
   bitrate?: string;
   durationMs?: number;
   outputBytes?: number;
@@ -34,6 +40,14 @@ export interface OperationalLogPayload {
   remaining?: number;
   activeStreams?: number;
   status?: number;
+  sizeBytes?: number;
+  estimatedSizeBytes?: number | null;
+  calculatedTimeoutMs?: number;
+  sizeSource?: string;
+  bytesPerSecond?: number;
+  megabytesPerSecond?: number;
+  progressPercent?: number;
+  downloadedBytes?: number;
 }
 
 // In-memory ring buffer for recent events (bounded to last 50 entries for diagnostics / tests)
