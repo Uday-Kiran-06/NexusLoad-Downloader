@@ -36,6 +36,7 @@ interface YtDlpFormat {
   abr?: number;
   filesize?: number;
   filesize_approx?: number;
+  ext?: string;
 }
 
 interface YtDlpInfo {
@@ -252,13 +253,31 @@ export async function POST(req: Request) {
     const audioSizeBytes = bestAudio?.filesize || bestAudio?.filesize_approx || 0;
 
     for (const height of sortedHeights) {
-      const videoSample = formats
-        .filter((f: YtDlpFormat) => f.height === height && f.vcodec && f.vcodec !== 'none')
-        .sort((a: YtDlpFormat, b: YtDlpFormat) => (b.filesize || b.filesize_approx || 0) - (a.filesize || a.filesize_approx || 0))[0];
+      // Match the actual MP4 format selected by yt-dlp (bestvideo[height<=...][ext=mp4])
+      const mp4Videos = formats.filter(
+        (f: YtDlpFormat) => f.height === height && f.vcodec && f.vcodec !== 'none' && f.ext === 'mp4'
+      );
+      const videoSample =
+        mp4Videos.length > 0
+          ? mp4Videos.sort(
+              (a: YtDlpFormat, b: YtDlpFormat) =>
+                (b.filesize || b.filesize_approx || 0) - (a.filesize || a.filesize_approx || 0)
+            )[0]
+          : formats
+              .filter((f: YtDlpFormat) => f.height === height && f.vcodec && f.vcodec !== 'none')
+              .sort(
+                (a: YtDlpFormat, b: YtDlpFormat) =>
+                  (b.filesize || b.filesize_approx || 0) - (a.filesize || a.filesize_approx || 0)
+              )[0];
 
       const videoSizeBytes = videoSample?.filesize || videoSample?.filesize_approx || 0;
       const totalBytes = videoSizeBytes + audioSizeBytes;
-      const sizeMB = totalBytes > 0 ? `~${(totalBytes / (1024 * 1024)).toFixed(0)} MB` : '—';
+      const sizeMB =
+        totalBytes > 0
+          ? totalBytes >= 1024 * 1024 * 1024
+            ? `~${(totalBytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+            : `~${(totalBytes / (1024 * 1024)).toFixed(0)} MB`
+          : '—';
       const sizeParam = totalBytes > 0 ? `&sizeBytes=${totalBytes}` : '';
 
       options.push({

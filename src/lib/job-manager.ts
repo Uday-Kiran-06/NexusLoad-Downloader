@@ -31,6 +31,7 @@ import {
   getDownloadBufferSize,
   parseYtDlpProgress,
   DEFAULT_CONCURRENT_FRAGMENTS,
+  DEFAULT_DOWNLOAD_MAX_TIMEOUT_MS,
 } from './process-manager';
 import { safeCleanupDirectory, getCookiesPath, cleanupCookiesFile } from './utils';
 import { ValidatedFormat, sanitizeMetadata } from './validation';
@@ -484,6 +485,9 @@ async function runYtDlpWithRetry(
     if (parsed?.percent !== undefined && !isNaN(parsed.percent)) {
       const computed = Math.round(baseProgress + (parsed.percent / 100) * progressScale);
       job.progress = Math.min(100, Math.max(0, computed));
+      // Refresh TTL while download is actively making progress to prevent premature sweeping of large downloads
+      const remainingTimeout = job.downloadTimeoutMs || DEFAULT_DOWNLOAD_MAX_TIMEOUT_MS;
+      job.expiresAt = Math.max(job.expiresAt, Date.now() + remainingTimeout + getJobTtlMs());
     }
 
     if (parsed?.bytesPerSecond !== undefined && parsed.bytesPerSecond > 0) {
@@ -598,6 +602,7 @@ export async function executeJobWorker(
     // Calculate production-safe size-aware timeout and emit structured event
     const timeoutDetails = getDownloadTimeoutDetails(job.estimatedSizeBytes);
     job.downloadTimeoutMs = timeoutDetails.timeoutMs;
+    job.expiresAt = Math.max(job.expiresAt, Date.now() + timeoutDetails.timeoutMs + getJobTtlMs());
 
     logOperationalEvent({
       event: 'download_timeout_calculated',
@@ -612,9 +617,11 @@ export async function executeJobWorker(
       jobId: job.id,
     });
 
-    const extractorArgs = isProduction
-      ? 'youtube:player_client=default,-android_sdkless'
-      : 'youtube:player_client=all';
+    const extractorArgs =
+      process.env.YT_EXTRACTOR_ARGS ||
+      (isProduction
+        ? 'youtube:player_client=default,-android_sdkless'
+        : 'youtube:player_client=all');
 
     const proxy = process.env.YT_PROXY || process.env.HTTP_PROXY || process.env.http_proxy;
 
@@ -632,6 +639,11 @@ export async function executeJobWorker(
       '--socket-timeout', '30',
       '--newline',
     ];
+
+    if (process.env.NEXUS_USE_ARIA2C === 'true') {
+      commonCliArgs.push('--external-downloader', 'aria2c');
+      commonCliArgs.push('--external-downloader-args', 'aria2c:-s 16 -x 16 -k 1M');
+    }
 
     if (proxy) commonCliArgs.push('--proxy', proxy);
     if (cookiesPath) commonCliArgs.push('--cookies', cookiesPath);
@@ -820,6 +832,7 @@ export async function executeJobWorker(
         job.contentType = 'audio/mpeg';
         job.actualContainer = 'mp3';
         job.completedAt = Date.now();
+        job.expiresAt = Date.now() + getJobTtlMs();
         job.progress = 100;
         job.stage = 'Download ready.';
 
@@ -894,6 +907,7 @@ export async function executeJobWorker(
       job.contentType = outputMime;
       job.actualContainer = containerExt;
       job.completedAt = Date.now();
+      job.expiresAt = Date.now() + getJobTtlMs();
       job.progress = 100;
       job.stage = 'Download ready.';
 
@@ -965,54 +979,63 @@ export async function executeJobWorker(
         `[job-manager] Job ${job.id} verified video file: ${path.basename(actualVideoFile)} (codec: ${videoStreamInfo.videoCodec || 'unknown'})`
       );
 
-      job.stage = 'Downloading audio stream...';
-      job.progress = 55;
-
-      const audioArgs = [
-        ...commonCliArgs,
-        '-o', audioOutputPattern,
-        '-f', formatValidation.audioSelector!,
-        validUrl,
-      ];
-
-      await runYtDlpWithRetry(job, ytDlpPath, audioArgs, 55, 25);
-
-      if ((job.status as JobStatus) === 'cancelled' || job.abortController.signal.aborted) return;
-
-      const downloadEnd = Date.now();
-      job.metrics.downloadDurationMs = downloadEnd - job.metrics.startTime;
-
-      // 2. Inspect temporary directory after audio download completes
-      const postAudioFiles = fs
-        .readdirSync(job.tmpDir)
-        .filter(
-          (f) => !f.endsWith('.part') && !f.endsWith('.ytdl') && path.join(job.tmpDir, f) !== actualVideoFile
-        );
-
+      // 2. Check if actualVideoFile ALREADY contains an audio stream
       let actualAudioFile: string | null = null;
       let audioStreamInfo: MediaStreamsInfo | null = null;
 
-      // Prioritize files starting with 'audio'
-      const audioCandidates = postAudioFiles
-        .filter((f) => f.startsWith('audio'))
-        .concat(postAudioFiles.filter((f) => !f.startsWith('audio')));
+      if (videoStreamInfo.hasAudio) {
+        console.log(
+          `[job-manager] Job ${job.id} video stream already contains audio track (${videoStreamInfo.audioCodec || 'unknown'}).`
+        );
+        actualAudioFile = actualVideoFile;
+        audioStreamInfo = videoStreamInfo;
+      } else {
+        // Video file does not contain audio; attempt downloading separate audio stream
+        job.stage = 'Downloading audio stream...';
+        job.progress = 55;
 
-      for (const file of audioCandidates) {
-        const fullPath = path.join(job.tmpDir, file);
-        const info = await inspectMediaStreams(fullPath);
-        if (info.hasAudio && !info.hasVideo) {
-          actualAudioFile = fullPath;
-          audioStreamInfo = info;
-          break;
+        const audioArgs = [
+          ...commonCliArgs,
+          '-o', audioOutputPattern,
+          '-f', formatValidation.audioSelector!,
+          validUrl,
+        ];
+
+        try {
+          await runYtDlpWithRetry(job, ytDlpPath, audioArgs, 55, 25);
+        } catch (audioErr) {
+          console.warn(
+            `[job-manager] Job ${job.id} audio stream download completed or failed:`,
+            audioErr instanceof Error ? audioErr.message : audioErr
+          );
         }
-      }
 
-      // Fallback: if no dedicated audio-only file was found, check if actualVideoFile already contains audio
-      if (!actualAudioFile) {
-        if (videoStreamInfo.hasAudio) {
-          actualAudioFile = actualVideoFile;
-          audioStreamInfo = videoStreamInfo;
-        } else {
+        if ((job.status as JobStatus) === 'cancelled' || job.abortController.signal.aborted) return;
+
+        // Inspect temporary directory after audio download completes
+        const postAudioFiles = fs
+          .readdirSync(job.tmpDir)
+          .filter(
+            (f) => !f.endsWith('.part') && !f.endsWith('.ytdl') && path.join(job.tmpDir, f) !== actualVideoFile
+          );
+
+        // Prioritize files starting with 'audio'
+        const audioCandidates = postAudioFiles
+          .filter((f) => f.startsWith('audio'))
+          .concat(postAudioFiles.filter((f) => !f.startsWith('audio')));
+
+        for (const file of audioCandidates) {
+          const fullPath = path.join(job.tmpDir, file);
+          const info = await inspectMediaStreams(fullPath);
+          if (info.hasAudio && !info.hasVideo) {
+            actualAudioFile = fullPath;
+            audioStreamInfo = info;
+            break;
+          }
+        }
+
+        // Fallback check among any files with audio
+        if (!actualAudioFile) {
           for (const file of audioCandidates) {
             const fullPath = path.join(job.tmpDir, file);
             const info = await inspectMediaStreams(fullPath);
@@ -1025,18 +1048,26 @@ export async function executeJobWorker(
         }
       }
 
-      if (!actualAudioFile || !audioStreamInfo?.hasAudio) {
-        throw new Error('Audio stream download failed: no valid audio stream found on disk.');
-      }
+      const downloadEnd = Date.now();
+      job.metrics.downloadDurationMs = downloadEnd - job.metrics.startTime;
 
-      console.log(
-        `[job-manager] Job ${job.id} verified audio file: ${path.basename(actualAudioFile)} (codec: ${audioStreamInfo.audioCodec || 'unknown'})`
-      );
+      const hasAudioTrack = Boolean(actualAudioFile && audioStreamInfo?.hasAudio);
+      if (hasAudioTrack) {
+        console.log(
+          `[job-manager] Job ${job.id} verified audio file: ${path.basename(actualAudioFile!)} (codec: ${audioStreamInfo?.audioCodec || 'unknown'})`
+        );
+      } else {
+        console.log(
+          `[job-manager] Job ${job.id} video has no audio stream (silent/muted media). Processing video-only output.`
+        );
+      }
 
       // Container compatibility detection
       // Rule: For MP4 requests (default), final output MUST be .mp4 with video/mp4.
       const isVideoWebm = path.extname(actualVideoFile).toLowerCase() === '.webm';
-      const isAudioWebm = path.extname(actualAudioFile).toLowerCase() === '.webm' || audioStreamInfo.audioCodec === 'opus';
+      const isAudioWebm =
+        hasAudioTrack &&
+        (path.extname(actualAudioFile!).toLowerCase() === '.webm' || audioStreamInfo?.audioCodec === 'opus');
       const requestedWebm = formatValidation.videoSelector?.includes('ext=webm');
       const isWebm = requestedWebm || (isVideoWebm && isAudioWebm && !formatValidation.videoSelector?.includes('ext=mp4'));
 
@@ -1046,7 +1077,9 @@ export async function executeJobWorker(
       const finalFilePath = path.join(job.tmpDir, `final_${job.id}.${containerExt}`);
 
       transitionStatus(job, 'processing');
-      job.stage = `Merging video and audio into ${containerExt.toUpperCase()}...`;
+      job.stage = hasAudioTrack
+        ? `Merging video and audio into ${containerExt.toUpperCase()}...`
+        : `Finalizing ${containerExt.toUpperCase()} video...`;
       job.progress = 85;
 
       // FFmpeg muxing
@@ -1098,7 +1131,13 @@ export async function executeJobWorker(
         const isAudioAac = audioStreamInfo?.audioCodec === 'aac';
         const outputOptions: string[] = [];
 
-        if (actualVideoFile === actualAudioFile) {
+        if (!hasAudioTrack) {
+          // Video-only (silent / muted media)
+          outputOptions.push('-c:v copy');
+          if (containerExt === 'mp4') {
+            outputOptions.push('-movflags +faststart');
+          }
+        } else if (actualVideoFile === actualAudioFile) {
           outputOptions.push('-c:v copy');
           if (containerExt === 'mp4') {
             if (isAudioAac) {
@@ -1156,7 +1195,7 @@ export async function executeJobWorker(
 
       // Stream verification on working merged file before finalizing
       const finalStreamCheck = await inspectMediaStreams(workingMergedFile);
-      if (!finalStreamCheck.hasVideo || !finalStreamCheck.hasAudio) {
+      if (!finalStreamCheck.hasVideo || (hasAudioTrack && !finalStreamCheck.hasAudio)) {
         try { fs.unlinkSync(workingMergedFile); } catch {}
         throw new Error(
           `Merged media file validation failed: missing required streams (hasVideo: ${finalStreamCheck.hasVideo}, hasAudio: ${finalStreamCheck.hasAudio}).`
@@ -1193,6 +1232,7 @@ export async function executeJobWorker(
       job.actualContainer = containerExt;
       job.actualHeight = formatValidation.height;
       job.completedAt = Date.now();
+      job.expiresAt = Date.now() + getJobTtlMs();
       job.progress = 100;
       job.stage = 'Download ready.';
 
@@ -1343,13 +1383,18 @@ export function createJob(params: {
     };
   }
 
+  const estimatedTimeoutMs = params.estimatedSizeBytes
+    ? calculateDownloadTimeout(params.estimatedSizeBytes)
+    : calculateDownloadTimeout(undefined);
+  const ttlMs = getJobTtlMs();
+
   const job: DownloadJob = {
     id,
     status: 'queued',
     progress: 5,
     stage: 'Job queued...',
     createdAt: Date.now(),
-    expiresAt: Date.now() + getJobTtlMs(),
+    expiresAt: Date.now() + estimatedTimeoutMs + ttlMs,
     fileName: params.safeTitle,
     contentType: params.formatValidation.isMp3
       ? 'audio/mpeg'
@@ -1409,6 +1454,36 @@ export function sweepExpiredJobs(): void {
   const now = Date.now();
   for (const [id, job] of jobStore.entries()) {
     try {
+      const isActive =
+        job.status === 'queued' ||
+        job.status === 'downloading' ||
+        job.status === 'processing';
+
+      // Active jobs are supervised by runCommandWithLifecycle and must not be swept by static creation TTL
+      if (isActive) {
+        // Failsafe: only abort if job has genuinely exceeded hard execution ceiling AND expiresAt
+        const maxLifetimeMs = (job.downloadTimeoutMs || DEFAULT_DOWNLOAD_MAX_TIMEOUT_MS) + 120_000;
+        if (now - job.createdAt > maxLifetimeMs && now > job.expiresAt) {
+          console.warn(`[job-manager] Active job ${id} exceeded maximum execution ceiling. Forcing abort.`);
+          job.abortController.abort();
+          if (job.activePid) {
+            killProcessTree(job.activePid);
+          }
+          transitionStatus(job, 'failed');
+          job.error = {
+            code: 'DOWNLOAD_TIMEOUT',
+            message: 'Download exceeded maximum execution time.',
+          };
+          if (job.slotAcquired) {
+            releaseDownloadSlot();
+            job.slotAcquired = false;
+          }
+          cleanupJobResources(job);
+          job.expiresAt = now + 60_000;
+        }
+        continue;
+      }
+
       if (now > job.expiresAt) {
         if (job.status !== 'expired') {
           console.log(`[job-manager] TTL expired for job ${id}`);

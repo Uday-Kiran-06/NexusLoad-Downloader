@@ -277,14 +277,21 @@ export default function Home() {
         pollIntervalRef.current = null;
       }
 
+      let consecutiveErrors = 0;
       await new Promise<void>((resolve, reject) => {
         pollIntervalRef.current = setInterval(async () => {
           try {
             const statusRes = await fetch(`/api/download/${jobId}/status`);
             if (!statusRes.ok) {
               const errData = await statusRes.json().catch(() => ({}));
+              consecutiveErrors++;
+              // Allow up to 3 consecutive polling retries for transient network drops or 429 rate limits
+              if (consecutiveErrors < 3) {
+                return;
+              }
               throw new Error(errData.message || "Failed to query download status.");
             }
+            consecutiveErrors = 0;
             const statusData = await statusRes.json();
 
             if (statusData.stage) setProgressStage(statusData.stage);
@@ -322,7 +329,11 @@ export default function Home() {
               if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
               reject(new Error(statusData.error?.message || "The download job failed."));
-            } else if (statusData.status === "cancelled" || statusData.status === "expired") {
+            } else if (statusData.status === "expired") {
+              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+              reject(new Error("The download job has expired. Please try again."));
+            } else if (statusData.status === "cancelled") {
               if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
               setIsDownloading(false);

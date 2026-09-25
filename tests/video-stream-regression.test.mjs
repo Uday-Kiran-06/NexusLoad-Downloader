@@ -275,4 +275,39 @@ test('Video Stream & 1080p MP4 Regression Suite', async (t) => {
     );
     assert.strictEqual(selectedVideoStreamInfo?.hasVideo, true);
   });
+
+  // ── 12. Silent/muted video stream (without audio track) remuxes into valid video MP4 ──
+  await t.test('12. Silent/muted video stream (without audio track) remuxes into valid video MP4 without error', async () => {
+    const silentVideoFile = path.join(tmpDir, 'silent_video.mp4');
+    const finalSilentMuxed = path.join(tmpDir, 'final_silent.mp4');
+
+    cp.execFileSync(resolvedFfmpegPath, [
+      '-hide_banner',
+      '-f', 'lavfi',
+      '-i', 'testsrc=duration=1:size=320x240:rate=1',
+      '-c:v', 'libx264',
+      '-an',
+      silentVideoFile,
+      '-y',
+    ]);
+
+    const initialStreams = await inspectMediaStreams(silentVideoFile);
+    assert.strictEqual(initialStreams.hasVideo, true);
+    assert.strictEqual(initialStreams.hasAudio, false);
+
+    // Mux using video-only faststart copy flags (used by job-manager for silent media)
+    cp.execFileSync(resolvedFfmpegPath, [
+      '-hide_banner',
+      '-i', silentVideoFile,
+      '-c:v', 'copy',
+      '-movflags', '+faststart',
+      finalSilentMuxed,
+      '-y',
+    ]);
+
+    const finalStreams = await inspectMediaStreams(finalSilentMuxed);
+    assert.strictEqual(finalStreams.hasVideo, true);
+    assert.strictEqual(finalStreams.hasAudio, false);
+    assert.strictEqual(path.extname(finalSilentMuxed), '.mp4');
+  });
 });

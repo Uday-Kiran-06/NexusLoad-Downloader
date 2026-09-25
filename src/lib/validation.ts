@@ -4,7 +4,9 @@ import net from 'net';
 const MAX_URL_LENGTH = parseInt(process.env.MAX_URL_LENGTH || '2048', 10);
 const MAX_FILENAME_LENGTH = parseInt(process.env.MAX_FILENAME_LENGTH || '100', 10);
 
-export const SUPPORTED_VIDEO_HEIGHTS = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320] as const;
+export const SUPPORTED_VIDEO_HEIGHTS = [
+  144, 240, 360, 480, 540, 576, 640, 720, 960, 1080, 1280, 1440, 1920, 2160, 4320,
+] as const;
 export type SupportedHeight = (typeof SUPPORTED_VIDEO_HEIGHTS)[number];
 
 export const SUPPORTED_MP3_BITRATES = ['128k', '192k', '256k', '320k'] as const;
@@ -517,10 +519,9 @@ export function validateAndMapFormat(params: {
   let parsedHeight: number | null = null;
 
   if (quality) {
-    const cleanQ = quality.replace(/p$/, '').trim();
-    const num = parseInt(cleanQ, 10);
-    if (!isNaN(num)) {
-      parsedHeight = num;
+    const cleanQ = quality.trim();
+    if (/^\d+p?$/i.test(cleanQ)) {
+      parsedHeight = parseInt(cleanQ.replace(/p$/i, ''), 10);
     }
   }
 
@@ -540,8 +541,15 @@ export function validateAndMapFormat(params: {
     };
   }
 
-  // Validate height is strictly within supported set
-  if (!SUPPORTED_VIDEO_HEIGHTS.includes(parsedHeight as SupportedHeight)) {
+  // Validate height is strictly within supported set or a valid even video resolution
+  const isSupportedHeight =
+    (SUPPORTED_VIDEO_HEIGHTS as readonly number[]).includes(parsedHeight) ||
+    (Number.isInteger(parsedHeight) &&
+      parsedHeight >= 144 &&
+      parsedHeight <= 4320 &&
+      parsedHeight % 2 === 0);
+
+  if (!isSupportedHeight) {
     return {
       valid: false,
       isAudioOnly: false,

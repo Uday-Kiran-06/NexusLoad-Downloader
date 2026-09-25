@@ -23,6 +23,12 @@ test('Contract & Security Regression: Server-Controlled Format Identifiers', asy
     assert.equal(v720.height, 720);
     assert.ok(v720.videoSelector?.includes('height<=720'));
 
+    // video + 540p (Pinterest / mobile qHD)
+    const v540 = validateAndMapFormat({ type: 'video', quality: '540p', format: 'mp4' });
+    assert.equal(v540.valid, true);
+    assert.equal(v540.height, 540);
+    assert.ok(v540.videoSelector?.includes('height<=540'));
+
     // video + 1080p
     const v1080 = validateAndMapFormat({ type: 'video', quality: '1080p', format: 'mp4' });
     assert.equal(v1080.valid, true);
@@ -49,6 +55,12 @@ test('Contract & Security Regression: Server-Controlled Format Identifiers', asy
     assert.equal(fid240.valid, true);
     assert.equal(fid240.height, 240);
     assert.ok(fid240.videoSelector?.includes('height<=240'));
+
+    // formatId video_540p (Pinterest)
+    const fid540 = validateAndMapFormat({ formatId: 'video_540p' });
+    assert.equal(fid540.valid, true);
+    assert.equal(fid540.height, 540);
+    assert.ok(fid540.videoSelector?.includes('height<=540'));
 
     // formatId video_720p
     const fid720 = validateAndMapFormat({ formatId: 'video_720p' });
@@ -105,6 +117,17 @@ test('Contract & Security Regression: Server-Controlled Format Identifiers', asy
     });
     assert.equal(uiBest.valid, true);
     assert.equal(uiBest.isBestQuality, true);
+
+    // Pinterest UI payload format
+    const uiPinterest540 = validateAndMapFormat({
+      type: 'video',
+      quality: '540p',
+      format: 'mp4',
+      formatId: 'video_540p',
+    });
+    assert.equal(uiPinterest540.valid, true);
+    assert.equal(uiPinterest540.height, 540);
+    assert.ok(uiPinterest540.videoSelector?.includes('height<=540'));
   });
 
   await t.test('3. Raw yt-dlp selectors from client are rejected', () => {
